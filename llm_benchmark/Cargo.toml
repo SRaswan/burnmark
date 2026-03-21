@@ -1,0 +1,56 @@
+[package]
+name = "llm_benchmark"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+# PyTorch via LibTorch C++ bindings
+tch = ["dep:burn-tch"]
+# Training benchmark with Burn's TUI dashboard (LearnerBuilder)
+# Enables autograd on NdArray + WGPU and runs LM training steps.
+train = ["dep:burn-train"]
+# Pure-Rust LLM inference via HuggingFace Candle
+candle = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:hf-hub",
+    "dep:tokenizers",
+]
+# Metal acceleration on macOS (used by candle)
+metal = ["candle-core?/metal"]
+# CUDA acceleration (used by candle)
+cuda = ["candle-core?/cuda"]
+
+[dependencies]
+burn = { version = "0.20.1", features = ["train"] }
+burn-ndarray = "0.20.1"
+burn-wgpu = "0.20.1"
+burn-tch   = { version = "0.20.1", optional = true }
+burn-train = { version = "0.20.1", optional = true }
+burn-optim = "0.20.1"
+
+# Pure-Rust LLM runtime (HuggingFace Candle)
+# Supports loading GGUF quantised models (TinyLlama, Phi-3, Llama-3, …)
+candle-core        = { version = "0.8", optional = true }
+candle-nn          = { version = "0.8", optional = true }
+candle-transformers = { version = "0.8", optional = true }
+hf-hub             = { version = "0.3", features = ["tokio"], optional = true }
+tokenizers         = { version = "0.21", optional = true, default-features = false, features = ["onig"] }
+
+# Async runtime needed by hf-hub
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# Utilities
+serde = { version = "1.0", features = ["derive"] }
+rand = "0.8"
+sysinfo = "0.30"
+ureq = "2"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "llm_benchmark"
+harness = false

@@ -7,7 +7,6 @@ This project evaluates the Rust ML ecosystem across two axes: *correctness* via 
 - **Tensor-level differential fuzzer/** that generates shape-aware SSA programs and tests Burn's autograd engine across NdArray, WGPU, and LibTorch backends. Discovered 17 distinct autograd crashes in Burn 0.20.1.
 - **Three-section benchmarking suite/** comparing Burn and Candle (pure-Rust LLM inference) against PyTorch on forward-pass throughput, real-model inference, and training workloads.
 
----
 
 ## Running the Benchmark (`llm_benchmark/`)
 
@@ -115,8 +114,9 @@ Crash artifacts are stored in `fuzz/artifacts/fuzz_autograd/`. Example reproduct
 | `LLM_BENCH_CANDLE_MODEL=<key>` | Select Candle model without `--model` flag |
 | `CANDLE_GGUF_PATH` / `CANDLE_TOKENIZER_PATH` | Override model/tokenizer paths with local files |
 
----
 
+## Roadmap
+=======
 ## Use of AI
 
 Parts of this codebase were developed with assistance from Claude (Anthropic). AI was used for code generation, debugging, architectural planning, and report writing. All AI-generated code was reviewed, tested, and validated by the team.
