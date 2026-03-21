@@ -1,84 +1,36 @@
 //! SSA instructions for fuzz IR.
 //!
 //! The register file is a `Vec<Tensor>`.  Each instruction produces exactly one
-//! value and appends it.  Operands are [`Reg(u8)`] indices guaranteed valid by
-//! the state-machine generator.
+//! value and appends it.  Operands are [`Reg(u8)`] references resolved at
+//! interpretation time as `raw % num_defined_regs`.
 
 use std::fmt;
 use arbitrary::Arbitrary;
 
 // ─── register reference ──────────────────────────────────────────────────────
 
-/// A register index into the SSA file.  The generator guarantees the index is
-/// in-bounds, so no modulo resolution is needed.
+/// A fuzzer-generated register reference.
+/// Resolved at interpretation time: `self.0 as usize % num_regs`.
 #[derive(Arbitrary, Debug, Clone, Copy)]
 pub struct Reg(pub u8);
 
 impl Reg {
-    /// Pretty-print as `rN`.
-    pub fn name(self) -> String {
-        format!("r{}", self.0)
-    }
-}
-
-impl From<Reg> for usize {
+    /// Resolve to a valid register index.  `num_regs` must be > 0.
     #[inline]
-    fn from(r: Reg) -> usize { r.0 as usize }
+    pub fn resolve(&self, num_regs: usize) -> usize {
+        (self.0 as usize) % num_regs
+    }
+
+    /// Pretty-print using the resolved index.
+    pub fn name(&self, num_regs: usize) -> String {
+        format!("r{}", self.resolve(num_regs))
+    }
 }
 
 impl fmt::Display for Reg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "r{}", self.0)
+        write!(f, "Reg({})", self.0)
     }
-}
-
-// ─── operation category (for the state-machine generator) ────────────────────
-
-/// High-level category of operation the generator should produce next.
-///
-/// Deriving `Arbitrary` lets the fuzzer engine decide the distribution instead
-/// of a hardcoded `int_in_range` lookup table.  The generator's state machine
-/// still fills in shape-legal operands for whichever category is drawn.
-#[derive(Arbitrary, Debug, Clone, Copy)]
-pub enum OpCategory {
-    Unary,
-    Binary,
-    Matmul,
-    Transpose,
-    DimReduce,
-    FullReduce,
-    Concat,
-    Repeat,
-    Powf,
-    Slice,
-}
-
-/// Which element-wise unary / activation to apply.
-///
-/// Same idea — `Arbitrary` picks; the generator just wraps the chosen variant
-/// around a register reference that is already known to be valid.
-#[derive(Arbitrary, Debug, Clone, Copy)]
-pub enum UnaryKind {
-    Neg,
-    Abs,
-    Exp,
-    Log,
-    Sqrt,
-    Cos,
-    Sin,
-    Relu,
-    Sigmoid,
-    Tanh,
-    Clamp,
-}
-
-/// Which element-wise binary op to apply.
-#[derive(Arbitrary, Debug, Clone, Copy)]
-pub enum BinaryKind {
-    Add,
-    Sub,
-    Mul,
-    Div,
 }
 
 // ─── SSA tensor instruction ──────────────────────────────────────────────────
@@ -91,15 +43,12 @@ pub enum TensorInstr {
     Add(Reg, Reg),
     Sub(Reg, Reg),
     Mul(Reg, Reg),
-    Div(Reg, Reg),
     // --- unary ---
     Neg(Reg),
     Abs(Reg),
     Exp(Reg),
     Log(Reg),
     Sqrt(Reg),
-    Cos(Reg),
-    Sin(Reg),
     // --- activations ---
     Relu(Reg),
     Sigmoid(Reg),
@@ -110,73 +59,54 @@ pub enum TensorInstr {
     // --- dimensional reductions ---
     SumDim(Reg, u8),
     MeanDim(Reg, u8),
-    ArgMax(Reg, u8),
     // --- layout ---
     Transpose(Reg),
     Concat(Reg, Reg, u8),
     Repeat(Reg, u8, u8),
-    Slice(Reg, u8, u8),
     // --- matmul ---
     Matmul(Reg, Reg),
-    // --- parametric ---
-    Powf(Reg, u8),
     // --- guard ---
     Clamp(Reg),
 }
 
 impl TensorInstr {
     /// Pretty-print one SSA line.
-    pub fn ssa_line(&self, out: &str) -> String {
+    /// `num_regs` = how many registers are defined *before* this instruction.
+    pub fn ssa_line(&self, out: &str, num_regs: usize) -> String {
         match self {
-            TensorInstr::Add(a, b)    => format!("{out} = {} + {}", a.name(), b.name()),
-            TensorInstr::Sub(a, b)    => format!("{out} = {} - {}", a.name(), b.name()),
-            TensorInstr::Mul(a, b)    => format!("{out} = {} * {}", a.name(), b.name()),
-            TensorInstr::Div(a, b)    => format!("{out} = {} / {}", a.name(), b.name()),
-            TensorInstr::Neg(r)       => format!("{out} = -{}", r.name()),
-            TensorInstr::Abs(r)       => format!("{out} = abs({})", r.name()),
-            TensorInstr::Exp(r)       => format!("{out} = exp({})", r.name()),
-            TensorInstr::Log(r)       => format!("{out} = log({})", r.name()),
-            TensorInstr::Sqrt(r)      => format!("{out} = sqrt({})", r.name()),
-            TensorInstr::Cos(r)       => format!("{out} = cos({})", r.name()),
-            TensorInstr::Sin(r)       => format!("{out} = sin({})", r.name()),
-            TensorInstr::Relu(r)      => format!("{out} = relu({})", r.name()),
-            TensorInstr::Sigmoid(r)   => format!("{out} = sigmoid({})", r.name()),
-            TensorInstr::Tanh(r)      => format!("{out} = tanh({})", r.name()),
-            TensorInstr::SumAll(r)    => format!("{out} = sum({})", r.name()),
-            TensorInstr::MeanAll(r)   => format!("{out} = mean({})", r.name()),
+            TensorInstr::Add(a, b)    => format!("{out} = {} + {}", a.name(num_regs), b.name(num_regs)),
+            TensorInstr::Sub(a, b)    => format!("{out} = {} - {}", a.name(num_regs), b.name(num_regs)),
+            TensorInstr::Mul(a, b)    => format!("{out} = {} * {}", a.name(num_regs), b.name(num_regs)),
+            TensorInstr::Neg(r)       => format!("{out} = -{}", r.name(num_regs)),
+            TensorInstr::Abs(r)       => format!("{out} = abs({})", r.name(num_regs)),
+            TensorInstr::Exp(r)       => format!("{out} = exp({})", r.name(num_regs)),
+            TensorInstr::Log(r)       => format!("{out} = log({})", r.name(num_regs)),
+            TensorInstr::Sqrt(r)      => format!("{out} = sqrt({})", r.name(num_regs)),
+            TensorInstr::Relu(r)      => format!("{out} = relu({})", r.name(num_regs)),
+            TensorInstr::Sigmoid(r)   => format!("{out} = sigmoid({})", r.name(num_regs)),
+            TensorInstr::Tanh(r)      => format!("{out} = tanh({})", r.name(num_regs)),
+            TensorInstr::SumAll(r)    => format!("{out} = sum({})  # → [1,1]", r.name(num_regs)),
+            TensorInstr::MeanAll(r)   => format!("{out} = mean({})  # → [1,1]", r.name(num_regs)),
             TensorInstr::SumDim(r, d)  => {
                 let dim = *d as usize % 2;
-                format!("{out} = sum({}, dim={dim})", r.name())
+                format!("{out} = sum({}, dim={dim})", r.name(num_regs))
             }
             TensorInstr::MeanDim(r, d) => {
                 let dim = *d as usize % 2;
-                format!("{out} = mean({}, dim={dim})", r.name())
+                format!("{out} = mean({}, dim={dim})", r.name(num_regs))
             }
-            TensorInstr::ArgMax(r, d)  => {
-                let dim = *d as usize % 2;
-                format!("{out} = argmax({}, dim={dim})", r.name())
-            }
-            TensorInstr::Transpose(r) => format!("{out} = {}.T", r.name()),
+            TensorInstr::Transpose(r) => format!("{out} = {}.T", r.name(num_regs)),
             TensorInstr::Concat(a, b, d) => {
                 let dim = *d as usize % 2;
-                format!("{out} = cat([{}, {}], dim={dim})", a.name(), b.name())
+                format!("{out} = cat([{}, {}], dim={dim})", a.name(num_regs), b.name(num_regs))
             }
             TensorInstr::Repeat(r, d, c) => {
                 let dim = *d as usize % 2;
                 let count = (*c as usize).clamp(1, 4);
-                format!("{out} = {}.repeat(dim={dim}, ×{count})", r.name())
+                format!("{out} = {}.repeat(dim={dim}, ×{count})", r.name(num_regs))
             }
-            TensorInstr::Slice(r, d, len) => {
-                let dim = *d as usize % 2;
-                format!("{out} = {}.slice(dim={dim}, 0..{len})", r.name())
-            }
-            TensorInstr::Matmul(a, b) => format!("{out} = {} @ {}", a.name(), b.name()),
-            TensorInstr::Powf(r, c)   => {
-                const EXPONENTS: [f32; 5] = [0.5, 2.0, 3.0, -1.0, 1.5];
-                let exp = EXPONENTS[(*c as usize) % EXPONENTS.len()];
-                format!("{out} = {}.powf({exp})", r.name())
-            }
-            TensorInstr::Clamp(r)     => format!("{out} = clamp({}, -1e6, 1e6)", r.name()),
+            TensorInstr::Matmul(a, b) => format!("{out} = {} @ {}", a.name(num_regs), b.name(num_regs)),
+            TensorInstr::Clamp(r)     => format!("{out} = clamp({}, -1e6, 1e6)", r.name(num_regs)),
         }
     }
 }
@@ -203,15 +133,16 @@ pub enum DiffOp {
 
 impl DiffOp {
     /// Pretty-print one SSA line.
+    /// `num_regs` = how many registers are defined *before* this instruction.
     /// For `Leaf`, a placeholder is printed; callers should override.
-    pub fn ssa_line(&self, out: &str) -> String {
+    pub fn ssa_line(&self, out: &str, num_regs: usize) -> String {
         match self {
             DiffOp::Leaf { rows, cols, .. } => {
                 let r = (*rows as usize).clamp(1, 16);
                 let c = (*cols as usize).clamp(1, 16);
                 format!("{out} = leaf({r}×{c})  [requires_grad]")
             }
-            DiffOp::Instr(i) => i.ssa_line(out),
+            DiffOp::Instr(i) => i.ssa_line(out, num_regs),
         }
     }
 }

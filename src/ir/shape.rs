@@ -1,13 +1,9 @@
-//! Core 2-D shape type and shape algebra for the IR.
+//! Core 2-D shape type shared across the IR.
 //!
-//! `Shape2` is the single source of truth.  Everything that computes or
-//! predicts shapes lives here:
-//!
-//!  * **predicates** – `broadcast_compatible`, `matmul_compatible`, …
-//!  * **result helpers** – `broadcast_result`
-//!
-//! Both the state-machine generator (`ir::generate`) and the interpreter
-//! (`ir::interpreter`) import from this single module.
+//! `Shape2` is the single source of truth for shape algebra (broadcasting,
+//! matmul compatibility, etc.).  Both the state-machine generator
+//! (`ir::generate`) and the interpreter (`ir::interpreter`) import it from
+//! here — no duplication.
 
 use std::fmt;
 
