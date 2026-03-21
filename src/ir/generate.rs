@@ -17,8 +17,7 @@
 //! This dramatically reduces shape-mismatch dead-ends and lets the fuzzer
 //! explore shape-changing operations without constant passthrough fallbacks.
 
-use arbitrary::{Arbitrary, Error as ArbError, Unstructured};
-
+use arbitrary::{Arbitrary, Unstructured, Error as ArbError};
 use super::ops::{DiffOp, Reg, TensorInstr};
 use super::program::AutogradProgram;
 use super::shape::Shape2;
@@ -27,33 +26,8 @@ use super::shape::Shape2;
 const MAX_BUILDER_LEAVES: usize = 4;
 /// Maximum total SSA steps (leaf introductions + operations).
 const MAX_STEPS: usize = 48;
-
 /// Cap on any single dimension to bound memory from Concat / Repeat.
-/// NOTE: this only constrains *growth ops*; leaf dims follow FUZZ_MIN_DIM/FUZZ_MAX_DIM.
-const MAX_GROW_DIM: usize = 48;
-
-// ─── env helpers ─────────────────────────────────────────────────────────────
-
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(default)
-}
-
-/// Read FUZZ_MIN_DIM / FUZZ_MAX_DIM from the environment, with sane caps.
-/// We cap to 255 because leaf dims are stored as u8 in the program IR.
-fn fuzz_dim_bounds_u8() -> (u8, u8) {
-    let min_dim = env_usize("FUZZ_MIN_DIM", 1).clamp(1, 4096);
-    let max_dim = env_usize("FUZZ_MAX_DIM", 16).clamp(min_dim, 4096);
-
-    let min_u8 = (min_dim.min(255)) as u8;
-    let max_u8 = (max_dim.min(255)) as u8;
-
-    // ensure min <= max (in case user sets FUZZ_MIN_DIM > 255)
-    let min_u8 = min_u8.min(max_u8);
-    (min_u8, max_u8)
-}
+const MAX_DIM: usize = 48;
 
 // ─── builder state machine ──────────────────────────────────────────────────
 
@@ -83,19 +57,12 @@ impl ProgramBuilder {
         }
     }
 
-    /// Register the seed leaf (r0). Called exactly once before stepping.
+    /// Register the seed leaf (r0).  Called exactly once before stepping.
     fn add_seed_leaf(&mut self, rows: u8, cols: u8, seed: Vec<u8>) {
-        let (min_u8, max_u8) = fuzz_dim_bounds_u8();
-
-        let rr = rows.clamp(min_u8, max_u8);
-        let cc = cols.clamp(min_u8, max_u8);
-
-        let r = rr as usize;
-        let c = cc as usize;
-
-        self.r0_rows = rr;
-        self.r0_cols = cc;
-
+        let r = (rows as usize).clamp(1, 16);
+        let c = (cols as usize).clamp(1, 16);
+        self.r0_rows = rows.clamp(1, 16);
+        self.r0_cols = cols.clamp(1, 16);
         self.arena.push(Shape2(r, c));
         self.leaf_seeds.push(seed);
         self.leaf_count = 1;
@@ -121,8 +88,6 @@ impl ProgramBuilder {
             return self.gen_operation(u);
         }
 
-        let (min_u8, max_u8) = fuzz_dim_bounds_u8();
-
         // 0 = fresh random
         // 1 = inherit rows   (same row-count as an existing register)
         // 2 = inherit cols   (same col-count as an existing register)
@@ -131,19 +96,19 @@ impl ProgramBuilder {
         let dim = match mode {
             1 if !self.arena.is_empty() => {
                 let src = self.arena[u.int_in_range(0..=self.arena.len() - 1)?];
-                Shape2(src.rows(), u.int_in_range(min_u8..=max_u8)? as usize)
+                Shape2(src.rows(), u.int_in_range(1..=16)?)
             }
             2 if !self.arena.is_empty() => {
                 let src = self.arena[u.int_in_range(0..=self.arena.len() - 1)?];
-                Shape2(u.int_in_range(min_u8..=max_u8)? as usize, src.cols())
+                Shape2(u.int_in_range(1..=16)?, src.cols())
             }
             3 if !self.arena.is_empty() => {
                 let src = self.arena[u.int_in_range(0..=self.arena.len() - 1)?];
-                Shape2(src.cols(), u.int_in_range(min_u8..=max_u8)? as usize)
+                Shape2(src.cols(), u.int_in_range(1..=16)?)
             }
             _ => Shape2(
-                u.int_in_range(min_u8..=max_u8)? as usize,
-                u.int_in_range(min_u8..=max_u8)? as usize,
+                u.int_in_range(1..=16)?,
+                u.int_in_range(1..=16)?,
             ),
         };
 
@@ -157,8 +122,8 @@ impl ProgramBuilder {
 
         self.ops.push(DiffOp::Leaf {
             seed: pool_idx as u8,
-            rows: dim.rows().min(255) as u8,
-            cols: dim.cols().min(255) as u8,
+            rows: dim.rows() as u8,
+            cols: dim.cols() as u8,
         });
         self.arena.push(dim);
         self.leaf_count += 1;
@@ -172,14 +137,14 @@ impl ProgramBuilder {
 
         let cat: u8 = u.int_in_range(0..=10)?;
         match cat {
-            0..=2 => self.gen_unary(u),        // ~27 % unary element-wise
+            0..=2 => self.gen_unary(u),       // ~27 % unary element-wise
             3..=4 => self.gen_binary(u),       // ~18 % add / sub / mul
-            5 => self.gen_matmul(u),           // ~ 9 %
-            6 => self.gen_transpose(u),        // ~ 9 %
-            7 => self.gen_dim_reduce(u),       // ~ 9 % sum_dim / mean_dim
-            8 => self.gen_full_reduce(u),      // ~ 9 % sum_all / mean_all
-            9 => self.gen_concat(u),           // ~ 9 %
-            _ => self.gen_repeat(u),           // ~ 9 %
+            5     => self.gen_matmul(u),       // ~ 9 %
+            6     => self.gen_transpose(u),    // ~ 9 %
+            7     => self.gen_dim_reduce(u),   // ~ 9 % sum_dim / mean_dim
+            8     => self.gen_full_reduce(u),  // ~ 9 % sum_all / mean_all
+            9     => self.gen_concat(u),       // ~ 9 %
+            _     => self.gen_repeat(u),       // ~ 9 %
         }
     }
 
@@ -219,7 +184,10 @@ impl ProgramBuilder {
     fn gen_transpose(&mut self, u: &mut Unstructured) -> Result<(), ArbError> {
         let (idx, reg) = self.pick_reg(u)?;
         let d = self.arena[idx];
-        self.push_instr(TensorInstr::Transpose(reg), Shape2(d.cols(), d.rows()));
+        self.push_instr(
+            TensorInstr::Transpose(reg),
+            Shape2(d.cols(), d.rows()),
+        );
         Ok(())
     }
 
@@ -308,9 +276,9 @@ impl ProgramBuilder {
             .filter(|&i| {
                 let sb = self.arena[i];
                 if dim == 0 {
-                    sa.cols() == sb.cols() && sa.rows() + sb.rows() <= MAX_GROW_DIM
+                    sa.cols() == sb.cols() && sa.rows() + sb.rows() <= MAX_DIM
                 } else {
-                    sa.rows() == sb.rows() && sa.cols() + sb.cols() <= MAX_GROW_DIM
+                    sa.rows() == sb.rows() && sa.cols() + sb.cols() <= MAX_DIM
                 }
             })
             .collect();
@@ -335,7 +303,7 @@ impl ProgramBuilder {
         let s = self.arena[idx];
         let dim: u8 = u.int_in_range(0..=1)?;
         let cur = if dim == 0 { s.rows() } else { s.cols() };
-        let max_times = (MAX_GROW_DIM / cur).min(4).max(1);
+        let max_times = (MAX_DIM / cur).min(4).max(1);
         let times: u8 = u.int_in_range(1..=max_times as u8)?;
         let out = if dim == 0 {
             Shape2(s.rows() * times as usize, s.cols())
@@ -364,13 +332,13 @@ impl<'a> Arbitrary<'a> for AutogradProgram {
     fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self, ArbError> {
         let mut b = ProgramBuilder::new();
 
-        let (min_u8, max_u8) = fuzz_dim_bounds_u8();
-
         // r0: seed leaf (always present)
-        let rows: u8 = u.int_in_range(min_u8..=max_u8)?;
-        let cols: u8 = u.int_in_range(min_u8..=max_u8)?;
+        let rows: u8 = u.int_in_range(1..=16)?;
+        let cols: u8 = u.int_in_range(1..=16)?;
         let seed_len: usize = u.int_in_range(1..=16)?;
-        let seed: Vec<u8> = (0..seed_len).map(|_| u.arbitrary()).collect::<Result<_, _>>()?;
+        let seed: Vec<u8> = (0..seed_len)
+            .map(|_| u.arbitrary())
+            .collect::<Result<_, _>>()?;
         b.add_seed_leaf(rows, cols, seed);
 
         // Generate program steps until fuzzer bytes are exhausted or limit hit

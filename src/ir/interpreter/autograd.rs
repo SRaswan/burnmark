@@ -36,11 +36,10 @@ fn eval_diff_op<AB: AutodiffBackend>(
     regs: &[Tensor<AB, 2>],
     shapes: &[Shape2],
     op: &DiffOp,
-    config: &FuzzConfig,
 ) -> Option<Tensor<AB, 2>> {
     match op {
         DiffOp::Leaf { .. } => None,
-        DiffOp::Instr(instr) => Some(eval_tensor_instr(regs, shapes, instr, config)),
+        DiffOp::Instr(instr) => Some(eval_tensor_instr(regs, shapes, instr)),
     }
 }
 
@@ -51,8 +50,8 @@ fn collect_grads<AB: AutodiffBackend>(
     config: &FuzzConfig,
     device: &AB::Device,
 ) -> Vec<Vec<f32>> {
-    let rows = (prog.rows as usize).clamp(config.min_dim, config.max_dim);
-    let cols = (prog.cols as usize).clamp(config.min_dim, config.max_dim);
+    let rows = (prog.rows as usize).clamp(1, 16);
+    let cols = (prog.cols as usize).clamp(1, 16);
 
     // r0 = seed leaf (always present)
     let leaf_0 = make_leaf::<AB>(
@@ -81,8 +80,8 @@ fn collect_grads<AB: AutodiffBackend>(
                         .get(pool_idx)
                         .map(Vec::as_slice)
                         .unwrap_or(&[]);
-                    let leaf_rows = (*lr as usize).clamp(config.min_dim, config.max_dim);
-                    let leaf_cols = (*lc as usize).clamp(config.min_dim, config.max_dim);
+                    let leaf_rows = (*lr as usize).clamp(1, 16);
+                    let leaf_cols = (*lc as usize).clamp(1, 16);
                     let leaf = make_leaf::<AB>(raw, leaf_rows, leaf_cols, device);
                     leaf_indices.push(regs.len());
                     leaf_shapes.push((leaf_rows, leaf_cols));
@@ -96,7 +95,7 @@ fn collect_grads<AB: AutodiffBackend>(
             _ => {
                 let out_shape = after_diff_op(&shapes, op)
                     .expect("non-Leaf op returned None shape");
-                let val = eval_diff_op(&regs, &shapes, op, config)
+                let val = eval_diff_op(&regs, &shapes, op)
                     .expect("non-Leaf op returned None");
                 (val, out_shape)
             }

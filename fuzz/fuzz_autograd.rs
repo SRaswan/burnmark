@@ -17,7 +17,7 @@ fuzz_target!(|prog: AutogradProgram| {
     let config = FuzzConfig::from_env();
     if prog.ops.len() < config.min_ops { return; }
     if let Err(msg) = interpreter::run_autograd_program(&prog, &config) {
-        let display = prog.ssa(&config);
+        let display = prog.ssa(config.max_leaves);
         match config.mode {
             HarnessMode::PanicOnFirstError => {
                 panic!("fuzz_autograd CRASH:\n{display}\nerror: {msg}");

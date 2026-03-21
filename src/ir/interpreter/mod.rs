@@ -15,9 +15,6 @@ use burn::backend::NdArray;
 use burn::tensor::{activation, Tensor};
 use burn::tensor::backend::Backend;
 
-// use burn::tensor::backend::AutodiffBackend;
-use crate::ir::program::FuzzConfig;
-
 use super::ops::TensorInstr;
 use shape::{Shape2, resolve_broadcast_compatible, resolve_matmul_compatible, resolve_concat_compatible};
 
@@ -74,16 +71,12 @@ fn compare_outputs(ndarray: &[f32], libtorch: &[f32], label: &str) {
 
 /// Evaluate one [`TensorInstr`] against the register file, using `shapes`
 /// to ensure binary operands are shape-compatible.
-/// Evaluate one [`TensorInstr`] against the register file, using `shapes`
-/// to ensure binary operands are shape-compatible.
 fn eval_tensor_instr<B: Backend>(
     regs: &[Tensor<B, 2>],
     shapes: &[Shape2],
     instr: &TensorInstr,
-    config: &FuzzConfig,
 ) -> Tensor<B, 2> {
     let n = regs.len();
-
     match instr {
         TensorInstr::Add(a, b) => {
             let ai = a.resolve(n);
@@ -107,36 +100,17 @@ fn eval_tensor_instr<B: Backend>(
                 None => regs[ai].clone(),
             }
         }
-
-        TensorInstr::Neg(r) => regs[r.resolve(n)].clone().neg(),
-        TensorInstr::Abs(r) => regs[r.resolve(n)].clone().abs(),
-        TensorInstr::Exp(r) => regs[r.resolve(n)].clone().exp(),
-
-        TensorInstr::Log(r) => {
-            let x = regs[r.resolve(n)].clone();
-            if config.safe_math {
-                x.clamp(1e-6_f32, 1e6_f32).log()
-            } else {
-                x.log()
-            }
-        }
-
-        TensorInstr::Sqrt(r) => {
-            let x = regs[r.resolve(n)].clone();
-            if config.safe_math {
-                x.clamp(0.0_f32, 1e6_f32).sqrt()
-            } else {
-                x.sqrt()
-            }
-        }
-
-        TensorInstr::Relu(r) => activation::relu(regs[r.resolve(n)].clone()),
-        TensorInstr::Sigmoid(r) => activation::sigmoid(regs[r.resolve(n)].clone()),
-        TensorInstr::Tanh(r) => activation::tanh(regs[r.resolve(n)].clone()),
-        TensorInstr::SumAll(r) => regs[r.resolve(n)].clone().sum().unsqueeze::<2>(),
-        TensorInstr::MeanAll(r) => regs[r.resolve(n)].clone().mean().unsqueeze::<2>(),
-
-        TensorInstr::SumDim(r, d) => {
+        TensorInstr::Neg(r)       => regs[r.resolve(n)].clone().neg(),
+        TensorInstr::Abs(r)       => regs[r.resolve(n)].clone().abs(),
+        TensorInstr::Exp(r)       => regs[r.resolve(n)].clone().exp(),
+        TensorInstr::Log(r)       => regs[r.resolve(n)].clone().log(),
+        TensorInstr::Sqrt(r)      => regs[r.resolve(n)].clone().sqrt(),
+        TensorInstr::Relu(r)      => activation::relu(regs[r.resolve(n)].clone()),
+        TensorInstr::Sigmoid(r)   => activation::sigmoid(regs[r.resolve(n)].clone()),
+        TensorInstr::Tanh(r)      => activation::tanh(regs[r.resolve(n)].clone()),
+        TensorInstr::SumAll(r)    => regs[r.resolve(n)].clone().sum().unsqueeze::<2>(),
+        TensorInstr::MeanAll(r)   => regs[r.resolve(n)].clone().mean().unsqueeze::<2>(),
+        TensorInstr::SumDim(r, d)  => {
             let dim = *d as usize % 2;
             regs[r.resolve(n)].clone().sum_dim(dim)
         }
@@ -144,9 +118,7 @@ fn eval_tensor_instr<B: Backend>(
             let dim = *d as usize % 2;
             regs[r.resolve(n)].clone().mean_dim(dim)
         }
-
         TensorInstr::Transpose(r) => regs[r.resolve(n)].clone().transpose(),
-
         TensorInstr::Concat(a, b, d) => {
             let ai = a.resolve(n);
             let dim = *d as usize % 2;
@@ -155,13 +127,11 @@ fn eval_tensor_instr<B: Backend>(
                 None => regs[ai].clone(),
             }
         }
-
         TensorInstr::Repeat(r, d, c) => {
             let dim = *d as usize % 2;
             let count = (*c as usize).clamp(1, 4);
             regs[r.resolve(n)].clone().repeat_dim(dim, count)
         }
-
-        TensorInstr::Clamp(r) => regs[r.resolve(n)].clone().clamp(-1e6_f32, 1e6_f32),
+        TensorInstr::Clamp(r)     => regs[r.resolve(n)].clone().clamp(-1e6_f32, 1e6_f32),
     }
 }
