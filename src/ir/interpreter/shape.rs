@@ -1,15 +1,13 @@
 //! Interpreter-side shape resolution and output-shape computation.
 //!
-//! The canonical [`Shape2`] type lives in `ir::shape`.  This module adds the
-//! `resolve_*` helpers (which need [`Reg`]) and the `after_*` methods that
-//! compute output shapes for every instruction variant.
+//!  This module adds the `resolve_*` helpers (which need [`Reg`]) and the `after_*` 
+//!  methods that compute output shapes for every instruction variant.
 
 pub(crate) use crate::ir::shape::Shape2;
 use crate::ir::ops::{Reg, TensorInstr, DiffOp};
 
 // ─── output shape computation ────────────────────────────────────────────────
 
-/// Given a [`TensorInstr`] and the current shape arena, compute the output shape.
 pub(crate) fn after_tensor_instr(shapes: &[Shape2], instr: &TensorInstr) -> Shape2 {
     let n = shapes.len();
     match instr {
@@ -71,8 +69,7 @@ pub(crate) fn after_tensor_instr(shapes: &[Shape2], instr: &TensorInstr) -> Shap
     }
 }
 
-/// Given a [`DiffOp`], compute the output shape.  Returns `None` for `Leaf`
-/// (handled by the main loop).
+/// Given a [`DiffOp`], compute the output shape.  
 pub(crate) fn after_diff_op(shapes: &[Shape2], op: &DiffOp) -> Option<Shape2> {
     match op {
         DiffOp::Leaf { .. } => None,
@@ -97,7 +94,7 @@ pub(crate) fn resolve_broadcast_compatible(shapes: &[Shape2], a_idx: usize, b_ra
             return i;
         }
     }
-    a_idx // ultimate fallback: a ⊕ a
+    a_idx 
 }
 
 /// For matmul, resolve operand `b` to a register where

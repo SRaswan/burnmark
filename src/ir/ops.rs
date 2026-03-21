@@ -70,7 +70,6 @@ pub enum TensorInstr {
 }
 
 impl TensorInstr {
-    /// Pretty-print one SSA line.
     /// `num_regs` = how many registers are defined *before* this instruction.
     pub fn ssa_line(&self, out: &str, num_regs: usize) -> String {
         match self {
@@ -127,12 +126,11 @@ pub enum DiffOp {
         rows: u8,
         cols: u8,
     },
-    /// Any tensor instruction (shared with plain-tensor programs).
+    /// Any tensor instruction.
     Instr(TensorInstr),
 }
 
 impl DiffOp {
-    /// Pretty-print one SSA line.
     /// `num_regs` = how many registers are defined *before* this instruction.
     /// For `Leaf`, a placeholder is printed; callers should override.
     pub fn ssa_line(&self, out: &str, num_regs: usize) -> String {

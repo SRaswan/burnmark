@@ -127,7 +127,7 @@ pub struct AutogradProgram {
 }
 
 impl AutogradProgram {
-    /// Pretty-print the program in SSA form, simulating register resolution
+    /// simulating register resolution
     /// and annotating every line with the output shape.
     pub fn ssa(&self, max_leaves: usize) -> String {
         use std::fmt::Write;
@@ -144,7 +144,6 @@ impl AutogradProgram {
             rows, cols, max_leaves
         );
 
-        // r0 = seed leaf (always present)
         let seed0_len = self.leaf_seeds.first().map(|v| v.len()).unwrap_or(0);
         let r0_shape = Shape2(rows, cols);
         let _ = writeln!(

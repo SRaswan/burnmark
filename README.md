@@ -1,160 +1,122 @@
-# fuzzburn
+# BurnMark
 
-fuzzburn generates random tensor programs and runs them through Burn, looking for:
+**Verifying and Benchmarking the Performance of Rust-Native LLM Agents**
 
-| Bug class | How it is detected |
-|---|---|
-| Panics / assertion failures | libFuzzer catches any `panic!` / `abort` |
-| Missing gradients | `fuzz_autograd` asserts both leaf tensors have `Some` gradient after `backward()` |
-| Shape / dtype errors | Triggered by the op-sequence structure driving illegal combinations |
+This project evaluates the Rust ML ecosystem across two axes: *correctness* via differential fuzzing and *performance* via benchmarking against PyTorch. It comprises two components:
 
-I want **differential fuzzing** in the future, so we run the same generated program through two backends (e.g. NdArray vs WGPU) and compare numeric outputs.
+- **Tensor-level differential fuzzer/** that generates shape-aware SSA programs and tests Burn's autograd engine across NdArray, WGPU, and LibTorch backends. Discovered 17 distinct autograd crashes in Burn 0.20.1.
+- **Three-section benchmarking suite/** comparing Burn and Candle (pure-Rust LLM inference) against PyTorch on forward-pass throughput, real-model inference, and training workloads.
 
----
 
-# Repository Structure
+## Running the Benchmark (`llm_benchmark/`)
 
-This repository is organized as a Cargo workspace with two main components:
+All commands run from `llm_benchmark/`.
 
-## fuzzburn (root crate)
-Fuzzing infrastructure for Burn tensor operations
-
-## llm_benchmark
-LLM inference benchmarking tool for comparing Burn backends and Candle performance
-
----
-
-## Architecture
-
-The fuzzer is built around a small **IR / AST**:
-
-```
-arbitrary (libFuzzer bytes)
-      │
-      ▼
- TensorProgram / AutogradProgram   ← program.rs  (AST root)
-      │  owns a Vec of
-      ▼
- TensorOp / DiffOp / TensorRef    ← ops.rs       (instruction set)
-      │
-      ▼
- interpreter.rs                   ← tree-walker → Burn tensor calls
-```
-
-This separation means:
-- AST: op enums and program structs are **Burn-agnostic** – they describe *what* to compute.
-- Burn entry: `interpreter.rs` is the only file that imports Burn – swapping backends or adding a second backend for differential testing only requires changes there.
-
-## File structure (gpt gen lol)
-
-```
-fuzzburn/
-├── Cargo.toml                  # main crate (fuzzburn lib + bin)
-├── llm_benchmark/              # LLM benchmarking subcrate
-│   ├── Cargo.toml
-│   ├── src/
-│   └── README.md
-├── src/
-│   ├── main.rs                 # stub entry point / usage hints
-│   ├── lib.rs                  # re-exports `pub mod ir`
-│   └── ir/
-│       ├── mod.rs              # module declarations
-│       ├── ops.rs              # TensorOp, DiffOp, TensorRef enums
-│       ├── program.rs          # TensorProgram, AutogradProgram (AST roots)
-│       └── interpreter.rs      # evaluates a program against Burn
-├── examples/
-│   └── simple_autograd.rs      # minimal y = x² autograd demo
-└── fuzz/
-    ├── Cargo.toml              # cargo-fuzz crate, depends on fuzzburn
-    ├── fuzz_tensor_ops.rs      # fuzz target: plain tensor API
-    └── fuzz_autograd.rs        # fuzz target: autodiff + backward pass
-```
-
----
-
-# Running llm_benchmark
-
-The `llm_benchmark` crate provides LLM inference benchmarking capabilities. It can benchmark:
-1. **Burn backend comparison** – Custom GPT architecture across NdArray (CPU), WGPU (GPU), and optionally LibTorch (PyTorch)
-2. **Candle pure-Rust generation** – Real quantised GGUF models via HuggingFace Candle
-3. **Training benchmark** – Burn's TUI dashboard for training steps
-
-## Basic llm_benchmark commands
+### Quick Start
 
 ```bash
-# Run basic Burn backend benchmarks (no download required)
-cargo run --release -p llm_benchmark
+# All three sections (Candle defaults to TinyLlama ~670 MB download on first run)
+cargo run --release  -p llm_benchmark --features candle,train -- --model tinyllama
+```
 
-# Run with Candle support (downloads ~700 MB GGUF on first run)
-cargo run --release -p llm_benchmark --features candle
+### Selecting Benchmark Sections
 
-# macOS Apple Silicon – use Metal GPU for Candle
-cargo run --release -p llm_benchmark --features candle,metal
+| Command | Sections Run |
+|---------|-------------|
+| `cargo run --release -p llm_benchmark` | 1 only |
+| `cargo run --release -p llm_benchmark --features candle` | 1 + 2 |
+| `cargo run --release -p llm_benchmark --features train` | 1 + 3 |
+| `cargo run --release -p llm_benchmark --features candle,train` | 1 + 2 + 3 |
+| `LLM_BENCH_SECTION3_ONLY=1 cargo run --release -p llm_benchmark --features train` | 3 only |
 
-# With training + TUI dashboard
-cargo run --release -p llm_benchmark --features train
+- **Section 1** — Burn backend throughput (NdArray CPU vs WGPU GPU, random weights)
+- **Section 2** — Candle LLM inference (real GGUF model, greedy decoding) — requires `candle` feature
+- **Section 3** — Training throughput with Burn Autodiff + TUI dashboard — requires `train` feature
 
-# All features (Candle + Metal + training)
+### Other Useful Commands
+
+##### GPU Acceleration 
+
+```bash
+# macOS Apple Silicon (Metal) — for Candle Section 2
 cargo run --release -p llm_benchmark --features candle,metal,train
 
-# Include LibTorch/PyTorch backend (requires libtorch installed)
+# CUDA
+cargo run --release -p llm_benchmark --features candle,cuda,train
+
+# LibTorch backend in Section 1 (requires libtorch installed)
 cargo run --release -p llm_benchmark --features tch
 ```
 
-For more details about llm_benchmark configuration and options, see `llm_benchmark/README.md`.
+##### Model Selection for Section 2
+
+```bash
+# List available models
+cargo run --release -p llm_benchmark --features candle -- --list-models
+
+# Select a model
+cargo run --release -p llm_benchmark --features candle -- --model phi3
+
+# Gated models require a HuggingFace token
+HF_TOKEN=hf_xxx cargo run --release -p llm_benchmark --features candle -- --model llama3-1b
+```
+
+| Key | Model | Size | Token Required |
+|-----|-------|------|----------------|
+| `tinyllama` | TinyLlama-1.1B Q4_K_M | ~670 MB | No |
+| `phi3` | Phi-3-Mini-4K Q4 | ~2.3 GB | No |
+| `llama3-1b` | Llama-3.2-1B Q4_K_M | ~0.8 GB | Yes |
+| `llama3-3b` | Llama-3.2-3B Q4_K_M | ~2.0 GB | Yes |
+
+##### Training Variants for Section 3
+
+```bash
+# Transpose-tied model only (exercises the autograd path where the fuzzer found crashes)
+LLM_BENCH_TRAIN_TRANSPOSE_ONLY=1 cargo run --release -p llm_benchmark --features train
+```
+
+##### Python Baseline
+
+```bash
+python python_benchmark/benchmark.py
+```
+
+Runs the same GPT architecture in PyTorch with identical configs for Section 1 comparison. Auto-selects MPS/CUDA/CPU.
 
 ---
 
-# Running fuzzburn
+## Running the Fuzzer
 
-## Prerequisites
+All commands run from `burnmark/`. Requires `cargo-fuzz` (`cargo install cargo-fuzz`) and a nightly toolchain.
 
-```sh
-# Rust nightly is required by cargo-fuzz / libFuzzer
-rustup install nightly
-
-# Install cargo-fuzz
-cargo install cargo-fuzz
-```
-
-## Running the examples
-
-```sh
-cargo run --example simple_autograd
-```
-
-## Running the fuzz targets
-
-```sh
-# Fuzz the plain tensor API (shape ops, activations, reductions)
-cargo +nightly fuzz run fuzz_tensor_ops
-
-# Fuzz the autodiff backend (backward pass, gradient correctness)
+```bash
+# Autograd fuzzing (backward-pass, found the 17 crashes)
 cargo +nightly fuzz run fuzz_autograd
 
-# Fuzz autodiff with LibTorch oracle comparison
-cargo +nightly fuzz run fuzz_autograd --features oracle-tch
+# Multi-op tensor program fuzzing (forward-pass only)
+cargo +nightly fuzz run fuzz_tensor_ops
+
+# Run a specific crash artifact for reproduction
+cargo +nightly fuzz run fuzz_autograd fuzz/artifacts/fuzz_autograd/<artifact-file>
 ```
 
-Useful flags:
-
-```sh
-# Limit each run to 1 second of wall time (good for CI)
-cargo fuzz run fuzz_tensor_ops -- -max_total_time=60
-
-# Run with more parallelism
-cargo fuzz run fuzz_autograd -- -workers=4
-
-# Minimise a crashing input after finding a bug
-cargo fuzz tmin fuzz_autograd <path/to/crash>
-```
-
-Crash artifacts are saved to `fuzz/artifacts/<target>/`.
+Crash artifacts are stored in `fuzz/artifacts/fuzz_autograd/`. Example reproductions are in `examples/`.
 
 ---
 
-## Roadmap
+## Environment Variables
 
-- [ ] **burn-ir differential fuzzing** – lower the same `TensorProgram` AST into `burn_ir::OperationDescription` nodes and replay it on two backends, comparing outputs.
-- [ ] Higher-rank tensors (3-D, 4-D) and batched ops.
-- [ ] Structured seed corpus of known interesting inputs.
+| Variable | Purpose |
+|----------|---------|
+| `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` | HuggingFace API token for gated models |
+| `LLM_BENCH_SECTION3_ONLY=1` | Skip Sections 1 & 2, run only Section 3 |
+| `LLM_BENCH_TRAIN_TRANSPOSE_ONLY=1` | Train only the transpose-tied model variant |
+| `LLM_BENCH_CANDLE_MODEL=<key>` | Select Candle model without `--model` flag |
+| `CANDLE_GGUF_PATH` / `CANDLE_TOKENIZER_PATH` | Override model/tokenizer paths with local files |
+
+
+## Roadmap
+=======
+## Use of AI
+
+Parts of this codebase were developed with assistance from Claude (Anthropic). AI was used for code generation, debugging, architectural planning, and report writing. All AI-generated code was reviewed, tested, and validated by the team.
