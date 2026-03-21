@@ -18,8 +18,7 @@ use crate::ir::program::TensorProgram;
 #[cfg(feature = "oracle-tch")]
 use super::compare_outputs;
 
-/// Run a plain SSA TensorProgram on any backend, returning the final
-/// register's data as `Vec<f32>`.
+/// Run a plain SSA TensorProgram on any backend, 
 fn eval_tensor_program<B: Backend>(prog: &TensorProgram, device: &B::Device) -> Vec<f32> {
     let rows = (prog.rows as usize).clamp(1, 16);
     let cols = (prog.cols as usize).clamp(1, 16);
@@ -48,7 +47,7 @@ fn eval_tensor_program<B: Backend>(prog: &TensorProgram, device: &B::Device) -> 
         .expect("into_data failed")
 }
 
-/// Run a plain SSA TensorProgram against NdArray (+ LibTorch oracle when enabled).
+/// Run a plain SSA TensorProgram against NdArray.
 pub fn run_tensor_program(prog: &TensorProgram) -> Result<(), String> {
     catch_as_result(std::panic::AssertUnwindSafe(|| {
         let nd = eval_tensor_program::<PlainB>(prog, &NdArrayDevice::default());

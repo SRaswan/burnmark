@@ -1,21 +1,10 @@
 //! Shape-aware state-machine program generator for [`AutogradProgram`].
-//!
-//! Instead of flat `#[derive(Arbitrary)]`, the generator maintains an arena of
-//! live register shapes and at each step either:
-//!
-//!  1. **New leaf** — introduces a new `requires_grad` tensor.  The leaf shape
-//!     can be fully random (starting a new branch) or can *inherit* one
-//!     dimension from an existing register and randomise the other (growing an
-//!     existing branch, creating natural compatibility for binary ops / matmul /
-//!     concat).
-//!
-//!  2. **Operation** — examines the arena and picks a mathematically legal op.
-//!     Unary / shape-changing ops (transpose, sum_dim, repeat, …) are always
-//!     legal.  Binary ops (add/sub/mul, matmul, concat) search for a compatible
+//!  1. New leaf — introduces a new `requires_grad` tensor.  The leaf shape
+//!     can be fully random or can inherit one dimension from an existing register and randomise the other
+//!  2. Operation — examines the arena and picks a mathematically legal op.
+//!     Unary / shape-changing ops are always legal.  Binary ops search for a compatible
 //!     pair; if none exists they fall back to a guaranteed-legal unary.
-//!
-//! This dramatically reduces shape-mismatch dead-ends and lets the fuzzer
-//! explore shape-changing operations without constant passthrough fallbacks.
+
 
 use arbitrary::{Arbitrary, Unstructured, Error as ArbError};
 use super::ops::{DiffOp, Reg, TensorInstr};

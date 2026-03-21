@@ -53,7 +53,6 @@ fn collect_grads<AB: AutodiffBackend>(
     let rows = (prog.rows as usize).clamp(1, 16);
     let cols = (prog.cols as usize).clamp(1, 16);
 
-    // r0 = seed leaf (always present)
     let leaf_0 = make_leaf::<AB>(
         prog.leaf_seeds.first().map(Vec::as_slice).unwrap_or(&[]),
         rows,
