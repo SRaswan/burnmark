@@ -1,6 +1,6 @@
 # BurnMark
 
-**Verifying and Benchmarking the Performance of Rust-Native LLM Agents**
+**Verifying and Benchmarking the Performance of Rust-Native LLM Agents vs Python**
 
 This project evaluates the Rust ML ecosystem across two axes: *correctness* via differential fuzzing and *performance* via benchmarking against PyTorch. It comprises two components:
 
