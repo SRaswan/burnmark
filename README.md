@@ -114,9 +114,6 @@ Crash artifacts are stored in `fuzz/artifacts/fuzz_autograd/`. Example reproduct
 | `LLM_BENCH_CANDLE_MODEL=<key>` | Select Candle model without `--model` flag |
 | `CANDLE_GGUF_PATH` / `CANDLE_TOKENIZER_PATH` | Override model/tokenizer paths with local files |
 
-
-## Roadmap
-=======
 ## Use of AI
 
 Parts of this codebase were developed with assistance from Claude (Anthropic). AI was used for code generation, debugging, architectural planning, and report writing. All AI-generated code was reviewed, tested, and validated by the team.
