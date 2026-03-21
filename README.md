@@ -10,6 +10,20 @@ fuzzburn generates random tensor programs and runs them through Burn, looking fo
 
 I want **differential fuzzing** in the future, so we run the same generated program through two backends (e.g. NdArray vs WGPU) and compare numeric outputs.
 
+---
+
+# Repository Structure
+
+This repository is organized as a Cargo workspace with two main components:
+
+## fuzzburn (root crate)
+Fuzzing infrastructure for Burn tensor operations
+
+## llm_benchmark
+LLM inference benchmarking tool for comparing Burn backends and Candle performance
+
+---
+
 ## Architecture
 
 The fuzzer is built around a small **IR / AST**:
@@ -36,6 +50,10 @@ This separation means:
 ```
 fuzzburn/
 ├── Cargo.toml                  # main crate (fuzzburn lib + bin)
+├── llm_benchmark/              # LLM benchmarking subcrate
+│   ├── Cargo.toml
+│   ├── src/
+│   └── README.md
 ├── src/
 │   ├── main.rs                 # stub entry point / usage hints
 │   ├── lib.rs                  # re-exports `pub mod ir`
@@ -51,6 +69,43 @@ fuzzburn/
     ├── fuzz_tensor_ops.rs      # fuzz target: plain tensor API
     └── fuzz_autograd.rs        # fuzz target: autodiff + backward pass
 ```
+
+---
+
+# Running llm_benchmark
+
+The `llm_benchmark` crate provides LLM inference benchmarking capabilities. It can benchmark:
+1. **Burn backend comparison** – Custom GPT architecture across NdArray (CPU), WGPU (GPU), and optionally LibTorch (PyTorch)
+2. **Candle pure-Rust generation** – Real quantised GGUF models via HuggingFace Candle
+3. **Training benchmark** – Burn's TUI dashboard for training steps
+
+## Basic llm_benchmark commands
+
+```bash
+# Run basic Burn backend benchmarks (no download required)
+cargo run --release -p llm_benchmark
+
+# Run with Candle support (downloads ~700 MB GGUF on first run)
+cargo run --release -p llm_benchmark --features candle
+
+# macOS Apple Silicon – use Metal GPU for Candle
+cargo run --release -p llm_benchmark --features candle,metal
+
+# With training + TUI dashboard
+cargo run --release -p llm_benchmark --features train
+
+# All features (Candle + Metal + training)
+cargo run --release -p llm_benchmark --features candle,metal,train
+
+# Include LibTorch/PyTorch backend (requires libtorch installed)
+cargo run --release -p llm_benchmark --features tch
+```
+
+For more details about llm_benchmark configuration and options, see `llm_benchmark/README.md`.
+
+---
+
+# Running fuzzburn
 
 ## Prerequisites
 
@@ -95,6 +150,8 @@ cargo fuzz tmin fuzz_autograd <path/to/crash>
 ```
 
 Crash artifacts are saved to `fuzz/artifacts/<target>/`.
+
+---
 
 ## Roadmap
 
