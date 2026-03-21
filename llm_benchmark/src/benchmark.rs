@@ -246,22 +246,7 @@ impl BenchmarkStats {
                 self.p50_latency_us, self.p95_latency_us
             );
         }
-        if self.estimated_kernels > 0 {
-            println!(
-                "║ Est. kernel launches: {:>29} ║",
-                self.estimated_kernels
-            );
-            println!(
-                "║ Est. launch overhead: {:>26} µs ║",
-                self.estimated_kernel_launch_us
-            );
-        }
-        if self.estimated_bandwidth_gbps > 0.0 {
-            println!(
-                "║ Est. bandwidth:     {:>30.2} GB/s ║",
-                self.estimated_bandwidth_gbps
-            );
-        }
+        
         println!(
             "║ Throughput:         {:>34.2} tok/s ║",
             self.tokens_per_second

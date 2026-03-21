@@ -360,23 +360,12 @@ pub mod inner {
         println!("  ┌───────────────────────────────┬──────────────────────────┐");
         println!("  │ Metric                        │ Value                    │");
         println!("  ├───────────────────────────────┼──────────────────────────┤");
-        println!(
-            "  │ Est. kernel launches/step     │ {:>24} │",
-            estimated_kernels
-        );
-        println!(
-            "  │ Est. launch overhead/step     │ {:>21} µs │",
-            estimated_kernel_launch_us
-        );
+        
         println!(
             "  │ Avg step time                 │ {:>21.2?} │",
             avg_step_time
         );
         let (bw_value, bw_unit) = format_bandwidth(estimated_bandwidth_gbps);
-        println!(
-            "  │ Est. bandwidth (avg step)     │ {:>19.2} {:<4} │",
-            bw_value, bw_unit
-        );
         println!("  └───────────────────────────────┴──────────────────────────┘\n");
     }
 
