@@ -124,9 +124,10 @@ pub fn run_section2(cli: &CliConfig, runtime: &RuntimeConfig) {
             if let Some(model_config) = model_config {
                 if let Some(token) = runtime.hf_token.as_deref() {
                     if std::env::var("HF_TOKEN").is_err()
-                        && std::env::var("HUGGING_FACE_HUB_TOKEN").is_err()
-                    {
+                        && std::env::var("HUGGING_FACE_HUB_TOKEN").is_err(){
+                        unsafe {
                         std::env::set_var("HF_TOKEN", token);
+                        }
                     }
                 }
 
