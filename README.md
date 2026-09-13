@@ -4,7 +4,7 @@
 
 This project evaluates the Rust ML ecosystem *correctness* via differential fuzzing:
 
-- **Tensor-level differential fuzzer/** that generates shape-aware SSA programs and tests Burn's autograd engine across NdArray, WGPU, and LibTorch backends. Discovered 17 distinct autograd crashes in Burn 0.20.1.
+- **Tensor-level differential fuzzer** that generates shape-aware SSA programs and tests Burn's autograd engine across NdArray, WGPU, and LibTorch backends. Discovered 17 distinct autograd crashes in Burn 0.20.1.
 
 ## Running the Fuzzer
 
