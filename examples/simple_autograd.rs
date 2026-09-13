@@ -1,12 +1,10 @@
 /// Burn autograd example
-/// cargo run --example simple_autograd
+/// cargo run --example simple_autograd --features oracle-tch
 
-use burn::backend::{Autodiff, LibTorch, NdArray};
-use burn::backend::libtorch::LibTorchDevice;
-use burn::tensor::{backend::AutodiffBackend, Tensor};
+use burn::tensor::{Device, Tensor};
 
-fn run<B: AutodiffBackend<FloatElem = f32>>(device: &B::Device, label: &str) {
-    let x_0: Tensor<B, 2> = Tensor::full([3, 3], 0.5_f32, device).require_grad();
+fn run(device: &Device, label: &str) {
+    let x_0: Tensor<2> = Tensor::full([3, 3], 0.5_f32, device).require_grad();
 
     let t0 = x_0.clone();
     let t1 = t0.clone();
@@ -18,15 +16,8 @@ fn run<B: AutodiffBackend<FloatElem = f32>>(device: &B::Device, label: &str) {
     println!("[{label}] x_0.grad = {}", x_grad.into_data());
 }
 
+#[allow(deprecated)] // Device::ndarray() — see note in src/ir/interpreter/tensor_program.rs
 fn main() {
-    run::<Autodiff<NdArray>>(
-        &<NdArray as burn::tensor::backend::Backend>::Device::default(),
-        "NdArray",
-    );
-
-    run::<Autodiff<LibTorch>>(
-        &LibTorchDevice::Cpu,
-        "LibTorch",
-    );
+    run(&Device::ndarray().autodiff(), "NdArray");
+    run(&Device::libtorch().autodiff(), "LibTorch");
 }
-

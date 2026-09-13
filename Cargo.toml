@@ -1,6 +1,6 @@
 [workspace]
-members = [".", "llm_benchmark"]
-exclude = ["fuzz"]
+members = ["."]
+exclude = ["fuzz", "llm_benchmark"]
 resolver = "2"
 
 [package]
@@ -13,8 +13,23 @@ default = []
 oracle-tch = ["burn/tch", "dep:tch", "dep:torch-sys"]
 
 [dependencies]
-burn = { version = "0.20.1", features = ["autodiff", "ndarray"] }
+burn = { version = "0.22.0-pre.3", features = ["autodiff", "ndarray"] }
 arbitrary = { version = "1.3", features = ["derive"] }
 tch = { version = "0.22.0", optional = true }
 torch-sys = { version = "0.22.0", optional = true }
-burn-ir = "0.20.1"
+burn-ir = "0.22.0-pre.3"
+
+# These examples compare NdArray against LibTorch directly, so they need the
+# `tch` backend compiled in — gate them the same way the fuzz targets'
+# LibTorch oracle path is gated.
+[[example]]
+name = "simple_autograd"
+required-features = ["oracle-tch"]
+
+[[example]]
+name = "transpose_bug"
+required-features = ["oracle-tch"]
+
+[[example]]
+name = "simd_recip_precision_bug"
+required-features = ["oracle-tch"]

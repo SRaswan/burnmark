@@ -11,14 +11,10 @@ mod autograd;
 pub use tensor_program::run_tensor_program;
 pub use autograd::run_autograd_program;
 
-use burn::backend::NdArray;
 use burn::tensor::{activation, Tensor};
-use burn::tensor::backend::Backend;
 
 use super::ops::TensorInstr;
 use shape::{Shape2, resolve_broadcast_compatible, resolve_matmul_compatible, resolve_concat_compatible};
-
-type PlainB = NdArray;
 
 // ─── shared utilities ────────────────────────────────────────────────────────
 
@@ -71,11 +67,17 @@ fn compare_outputs(ndarray: &[f32], libtorch: &[f32], label: &str) {
 
 /// Evaluate one [`TensorInstr`] against the register file, using `shapes`
 /// to ensure binary operands are shape-compatible.
-fn eval_tensor_instr<B: Backend>(
-    regs: &[Tensor<B, 2>],
+///
+/// Burn 0.22 dropped the `Backend` type parameter from `Tensor` — which
+/// backend actually runs an op is now a property of the `Device` a tensor
+/// was created on, not of the tensor's type.  So this function (and the
+/// register file it operates on) no longer needs to be generic at all; the
+/// same code path handles NdArray and LibTorch registers alike.
+fn eval_tensor_instr(
+    regs: &[Tensor<2>],
     shapes: &[Shape2],
     instr: &TensorInstr,
-) -> Tensor<B, 2> {
+) -> Tensor<2> {
     let n = regs.len();
     match instr {
         TensorInstr::Add(a, b) => {
