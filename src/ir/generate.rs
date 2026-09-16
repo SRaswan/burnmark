@@ -154,7 +154,7 @@ impl ProgramBuilder {
     fn gen_unary(&mut self, u: &mut Unstructured) -> Result<(), ArbError> {
         let (idx, reg) = self.pick_reg(u)?;
         let dim = self.arena[idx];
-        let v: u8 = u.int_in_range(0..=8)?;
+        let v: u8 = u.int_in_range(0..=9)?;
         let instr = match v {
             0 => TensorInstr::Neg(reg),
             1 => TensorInstr::Abs(reg),
@@ -164,7 +164,8 @@ impl ProgramBuilder {
             5 => TensorInstr::Relu(reg),
             6 => TensorInstr::Sigmoid(reg),
             7 => TensorInstr::Tanh(reg),
-            _ => TensorInstr::Clamp(reg),
+            8 => TensorInstr::Clamp(reg),
+            _ => TensorInstr::PowfScalar(reg, u.arbitrary()?),
         };
         self.push_instr(instr, dim);
         Ok(())
@@ -224,11 +225,12 @@ impl ProgramBuilder {
         let sb = self.arena[bi];
         let out = sa.broadcast_result(sb);
 
-        let v: u8 = u.int_in_range(0..=2)?;
+        let v: u8 = u.int_in_range(0..=3)?;
         let instr = match v {
             0 => TensorInstr::Add(a_reg, Reg(bi as u8)),
             1 => TensorInstr::Sub(a_reg, Reg(bi as u8)),
-            _ => TensorInstr::Mul(a_reg, Reg(bi as u8)),
+            2 => TensorInstr::Mul(a_reg, Reg(bi as u8)),
+            _ => TensorInstr::Div(a_reg, Reg(bi as u8)),
         };
         self.push_instr(instr, out);
         Ok(())

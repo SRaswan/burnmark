@@ -33,3 +33,16 @@ required-features = ["oracle-tch"]
 [[example]]
 name = "simd_recip_precision_bug"
 required-features = ["oracle-tch"]
+
+[[example]]
+name = "powi_scalar_zero_grad_bug"
+required-features = ["oracle-tch"]
+
+# Deliberately NOT patched to the local fixed burn/macerator checkouts here
+# (unlike fuzz/Cargo.toml): every bug-repro example in this crate — this one
+# included — is meant to demonstrate the bug against real, currently-published
+# 0.22.0-pre.3, i.e. what anyone hitting this today actually sees. Patching
+# root would silently "fix" simd_recip_precision_bug.rs and this file's
+# reproduction too, defeating their purpose. Run examples against unpatched
+# crates.io burn; run the fuzzer itself (fuzz/Cargo.toml's patches) against
+# the locally-fixed checkouts, to confirm fixes and keep hunting past them.

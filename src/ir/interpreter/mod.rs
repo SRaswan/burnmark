@@ -13,7 +13,7 @@ pub use autograd::run_autograd_program;
 
 use burn::tensor::{activation, Tensor};
 
-use super::ops::TensorInstr;
+use super::ops::{TensorInstr, POWF_EXPONENTS};
 use shape::{Shape2, resolve_broadcast_compatible, resolve_matmul_compatible, resolve_concat_compatible};
 
 // ─── shared utilities ────────────────────────────────────────────────────────
@@ -95,6 +95,11 @@ fn eval_tensor_instr(
             let bi = resolve_broadcast_compatible(shapes, ai, b);
             regs[ai].clone() * regs[bi].clone()
         }
+        TensorInstr::Div(a, b) => {
+            let ai = a.resolve(n);
+            let bi = resolve_broadcast_compatible(shapes, ai, b);
+            regs[ai].clone() / regs[bi].clone()
+        }
         TensorInstr::Matmul(a, b) => {
             let ai = a.resolve(n);
             match resolve_matmul_compatible(shapes, ai, b) {
@@ -107,6 +112,10 @@ fn eval_tensor_instr(
         TensorInstr::Exp(r)       => regs[r.resolve(n)].clone().exp(),
         TensorInstr::Log(r)       => regs[r.resolve(n)].clone().log(),
         TensorInstr::Sqrt(r)      => regs[r.resolve(n)].clone().sqrt(),
+        TensorInstr::PowfScalar(r, e) => {
+            let exp = POWF_EXPONENTS[*e as usize % POWF_EXPONENTS.len()];
+            regs[r.resolve(n)].clone().powf_scalar(exp)
+        }
         TensorInstr::Relu(r)      => activation::relu(regs[r.resolve(n)].clone()),
         TensorInstr::Sigmoid(r)   => activation::sigmoid(regs[r.resolve(n)].clone()),
         TensorInstr::Tanh(r)      => activation::tanh(regs[r.resolve(n)].clone()),

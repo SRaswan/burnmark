@@ -27,6 +27,13 @@ fn eval_tensor_program(prog: &TensorProgram, device: &Device) -> Vec<f32> {
 
     for instr in &prog.ops {
         let out_shape = after_tensor_instr(&shapes, instr);
+        // Chained Repeat/Concat/Matmul on this unconstrained op stream can
+        // otherwise compound into a multi-gigabyte single allocation (see
+        // `Shape2::exceeds_cap`'s doc comment) — stop here rather than let it
+        // OOM the whole fuzz process; not a bug, just a generation-space gap.
+        if out_shape.exceeds_cap() {
+            break;
+        }
         let val = eval_tensor_instr(&regs, &shapes, instr);
         regs.push(val);
         shapes.push(out_shape);
