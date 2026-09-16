@@ -31,3 +31,26 @@ name = "fuzz_autograd"
 path = "fuzz_autograd.rs"
 test = false
 doc = false
+
+# All three known-fixed bugs patched in locally (none of the fixes are
+# upstream/published yet) so re-fuzzing surfaces NEW distinct crashes instead
+# of drowning in these:
+#   - burn: fix-powi-scalar-zero-grad branch (in a separate worktree,
+#     ~/Documents/Workspace/burn-powi-fix — stacked on fix-sign-nan so both
+#     fixes are present):
+#       - sign(NaN) == 0 in burn-ndarray's sign_op, fixes abs(log(x<0))
+#         gradient
+#       - burn-flex's float_sign had the same NaN bug independently (fixed
+#         upstream in the shared ~/Documents/Workspace/burn checkout, commit
+#         c11a8a037, by a peer session — not part of this worktree's own
+#         commits, but inherited since this branch is stacked on top)
+#       - x.powf_scalar(0) detached from the autodiff graph (float_ones has
+#         no relation to the input, so Autodiff<B> lost the backward edge);
+#         fixes the panic "Tensor::backward requires a tracked autodiff
+#         tensor" whenever a powf(0) precedes .backward()
+#   - macerator: v0.3.4-newton-fix branch (Newton-Raphson refinement after
+#     the aarch64 vrecpeq_f32 estimate, fixes recip() precision)
+[patch.crates-io]
+burn = { path = "/Users/sraswan/Documents/Workspace/burn-powi-fix/crates/burn" }
+burn-ir = { path = "/Users/sraswan/Documents/Workspace/burn-powi-fix/crates/burn-ir" }
+macerator = { path = "/Users/sraswan/Documents/Workspace/macerator-v0.3.4-fixed" }

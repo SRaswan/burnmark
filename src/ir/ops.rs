@@ -33,6 +33,18 @@ impl fmt::Display for Reg {
     }
 }
 
+// ─── powf exponent table ──────────────────────────────────────────────────────
+
+/// Curated exponents for `PowfScalar`, indexed by `u8 % POWF_EXPONENTS.len()`.
+/// Mixes negative, fractional, and integer values: negative bases raised to a
+/// fractional exponent are undefined over the reals (`x.powf(0.5)` for
+/// `x < 0`), which is exactly the kind of special-value edge (NaN in the
+/// forward pass, and whatever that does to `grad * exp * x^(exp-1)` in the
+/// backward pass) both backends need to agree on.
+pub const POWF_EXPONENTS: [f32; 16] = [
+    -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0,
+];
+
 // ─── SSA tensor instruction ──────────────────────────────────────────────────
 
 /// SSA instruction for plain tensor programs.
@@ -43,12 +55,15 @@ pub enum TensorInstr {
     Add(Reg, Reg),
     Sub(Reg, Reg),
     Mul(Reg, Reg),
+    Div(Reg, Reg),
     // --- unary ---
     Neg(Reg),
     Abs(Reg),
     Exp(Reg),
     Log(Reg),
     Sqrt(Reg),
+    /// `reg.powf_scalar(POWF_EXPONENTS[idx % 16])`.
+    PowfScalar(Reg, u8),
     // --- activations ---
     Relu(Reg),
     Sigmoid(Reg),
@@ -76,11 +91,16 @@ impl TensorInstr {
             TensorInstr::Add(a, b)    => format!("{out} = {} + {}", a.name(num_regs), b.name(num_regs)),
             TensorInstr::Sub(a, b)    => format!("{out} = {} - {}", a.name(num_regs), b.name(num_regs)),
             TensorInstr::Mul(a, b)    => format!("{out} = {} * {}", a.name(num_regs), b.name(num_regs)),
+            TensorInstr::Div(a, b)    => format!("{out} = {} / {}", a.name(num_regs), b.name(num_regs)),
             TensorInstr::Neg(r)       => format!("{out} = -{}", r.name(num_regs)),
             TensorInstr::Abs(r)       => format!("{out} = abs({})", r.name(num_regs)),
             TensorInstr::Exp(r)       => format!("{out} = exp({})", r.name(num_regs)),
             TensorInstr::Log(r)       => format!("{out} = log({})", r.name(num_regs)),
             TensorInstr::Sqrt(r)      => format!("{out} = sqrt({})", r.name(num_regs)),
+            TensorInstr::PowfScalar(r, e) => {
+                let exp = POWF_EXPONENTS[*e as usize % POWF_EXPONENTS.len()];
+                format!("{out} = {}.powf({exp})", r.name(num_regs))
+            }
             TensorInstr::Relu(r)      => format!("{out} = relu({})", r.name(num_regs)),
             TensorInstr::Sigmoid(r)   => format!("{out} = sigmoid({})", r.name(num_regs)),
             TensorInstr::Tanh(r)      => format!("{out} = tanh({})", r.name(num_regs)),

@@ -13,7 +13,8 @@ pub(crate) fn after_tensor_instr(shapes: &[Shape2], instr: &TensorInstr) -> Shap
     match instr {
         TensorInstr::Add(a, b)
         | TensorInstr::Sub(a, b)
-        | TensorInstr::Mul(a, b) => {
+        | TensorInstr::Mul(a, b)
+        | TensorInstr::Div(a, b) => {
             let sa = shapes[a.resolve(n)];
             let sb = shapes[resolve_broadcast_compatible(shapes, a.resolve(n), b)];
             sa.broadcast_result(sb)
@@ -30,6 +31,7 @@ pub(crate) fn after_tensor_instr(shapes: &[Shape2], instr: &TensorInstr) -> Shap
         | TensorInstr::Exp(r)
         | TensorInstr::Log(r)
         | TensorInstr::Sqrt(r)
+        | TensorInstr::PowfScalar(r, _)
         | TensorInstr::Relu(r)
         | TensorInstr::Sigmoid(r)
         | TensorInstr::Tanh(r)

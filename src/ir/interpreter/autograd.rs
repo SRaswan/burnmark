@@ -85,6 +85,15 @@ fn collect_grads(
             _ => {
                 let out_shape = after_diff_op(&shapes, op)
                     .expect("non-Leaf op returned None shape");
+                // Defensive backstop matching the plain TensorProgram path
+                // (see `Shape2::exceeds_cap`'s doc comment) — the generator
+                // already keeps shapes far under this via MAX_DIM, so this
+                // should never actually trigger here, but stopping early is
+                // cheap insurance against a multi-gigabyte allocation rather
+                // than an OOM abort.
+                if out_shape.exceeds_cap() {
+                    break;
+                }
                 let val = eval_diff_op(&regs, &shapes, op)
                     .expect("non-Leaf op returned None");
                 (val, out_shape)
