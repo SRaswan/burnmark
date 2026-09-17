@@ -4,11 +4,8 @@ use burn::tensor::{Device, Tensor};
 
 use super::shape::Shape2;
 use super::shape::after_tensor_instr;
-use super::{bytes_to_floats, catch_as_result, eval_tensor_instr};
-use crate::ir::program::TensorProgram;
-
-#[cfg(feature = "oracle-tch")]
-use super::compare_outputs;
+use super::{assert_agreement, bytes_to_floats, catch_as_result, device_for, eval_tensor_instr};
+use crate::ir::program::{FuzzConfig, TensorProgram};
 
 /// Run a plain SSA TensorProgram on whichever backend `device` selects.
 fn eval_tensor_program(prog: &TensorProgram, device: &Device) -> Vec<f32> {
@@ -46,24 +43,24 @@ fn eval_tensor_program(prog: &TensorProgram, device: &Device) -> Vec<f32> {
         .expect("into_data failed")
 }
 
-/// Run a plain SSA TensorProgram against NdArray.
-///
-/// `Device::ndarray()` is deprecated in favor of `Device::flex()` as of 0.22,
-/// but burn-flex is a distinct pure-Rust implementation with its own
-/// semantics — swapping backends here would change what we're differentially
-/// testing, not just how we spell it. Keep NdArray as the "left" oracle side
-/// until burn-flex has had a comparable amount of scrutiny.
-#[allow(deprecated)]
-pub fn run_tensor_program(prog: &TensorProgram) -> Result<(), String> {
+/// Run a plain SSA TensorProgram on every backend in `config.backends` and
+/// require them to agree.  The first entry is the reference side; a single entry
+/// simply executes the program with no comparison.
+pub fn run_tensor_program(prog: &TensorProgram, config: &FuzzConfig) -> Result<(), String> {
     catch_as_result(std::panic::AssertUnwindSafe(|| {
-        let nd = eval_tensor_program(prog, &Device::ndarray());
-        #[cfg(feature = "oracle-tch")]
-        run_tensor_program_oracle(prog, nd);
-    }))
-}
+        let outputs: Vec<(&'static str, Vec<f32>)> = config
+            .backends
+            .iter()
+            .map(|&backend| {
+                let device = device_for(backend);
+                (backend.name(), eval_tensor_program(prog, &device))
+            })
+            .collect();
 
-#[cfg(feature = "oracle-tch")]
-fn run_tensor_program_oracle(prog: &TensorProgram, nd: Vec<f32>) {
-    let lt = eval_tensor_program(prog, &Device::libtorch());
-    compare_outputs(&nd, &lt, "tensor_program");
+        let view: Vec<(&'static str, &[f32])> = outputs
+            .iter()
+            .map(|(name, out)| (*name, out.as_slice()))
+            .collect();
+        assert_agreement(&view, "tensor_program");
+    }))
 }

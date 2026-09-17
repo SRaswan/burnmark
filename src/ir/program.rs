@@ -11,6 +11,119 @@ pub enum HarnessMode {
     Continuous,
 }
 
+// ─── backend selection ────────────────────────────────────────────────────────
+
+/// A backend the interpreter can run a program on.
+///
+/// Which backends a build *can* run is decided at compile time by cargo
+/// features; which it *does* run is chosen at runtime by `BACKENDS`.  Keeping
+/// those separate means one binary can be pointed at any pairing without a
+/// rebuild — `libtorch,ndarray`, `libtorch,flex`, `flex,ndarray`, or `all`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// Deprecated as of burn 0.22 (slated for removal in favour of `Flex`), but
+    /// still where most known bugs live, so still worth testing.
+    NdArray,
+    /// burn-flex: the pure-Rust CPU backend replacing NdArray.  A distinct
+    /// implementation, not a rename — the two disagree in practice.
+    Flex,
+    /// LibTorch via `tch`.  A separate project following PyTorch's documented
+    /// special-value conventions, which makes it the best available reference.
+    LibTorch,
+}
+
+impl Backend {
+    /// Name used in `BACKENDS` and in divergence reports.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Backend::NdArray => "ndarray",
+            Backend::Flex => "flex",
+            Backend::LibTorch => "libtorch",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "ndarray" | "nd" => Some(Backend::NdArray),
+            "flex" => Some(Backend::Flex),
+            "libtorch" | "tch" | "torch" => Some(Backend::LibTorch),
+            _ => None,
+        }
+    }
+
+    /// Whether this build was compiled with support for this backend.
+    pub const fn is_compiled_in(self) -> bool {
+        match self {
+            Backend::NdArray => true,
+            Backend::Flex => cfg!(feature = "oracle-flex"),
+            Backend::LibTorch => cfg!(feature = "oracle-tch"),
+        }
+    }
+
+    /// Every backend this build can run, most-trustworthy first.
+    pub fn available() -> Vec<Self> {
+        [Backend::LibTorch, Backend::NdArray, Backend::Flex]
+            .into_iter()
+            .filter(|b| b.is_compiled_in())
+            .collect()
+    }
+}
+
+/// Backends to run, **reference side first** — every other backend is compared
+/// against the first, and divergences are reported as `<backend> vs <reference>`.
+///
+/// Parsed from `BACKENDS`: a comma-separated list of names, or `all`.  Unset
+/// keeps the historical pairing (LibTorch as reference against NdArray when
+/// `oracle-tch` is compiled in, NdArray alone otherwise) so existing corpora and
+/// artifacts stay comparable.  A single entry runs the program without any
+/// comparison, which is useful for smoke and throughput runs.
+///
+/// An unparseable or unavailable selection panics rather than silently dropping
+/// a requested side: quietly comparing fewer backends than asked for would
+/// manufacture exactly the false confidence this fuzzer exists to prevent.
+pub fn backends_from_env() -> Vec<Backend> {
+    let requested = match std::env::var("BACKENDS") {
+        Err(_) => return Backend::available(),
+        Ok(raw) if raw.trim().is_empty() => return Backend::available(),
+        Ok(raw) if raw.trim().eq_ignore_ascii_case("all") => return Backend::available(),
+        Ok(raw) => raw,
+    };
+
+    let mut selected: Vec<Backend> = Vec::new();
+    for token in requested.split(',') {
+        let name = token.trim().to_lowercase();
+        if name.is_empty() {
+            continue;
+        }
+        let backend = Backend::from_name(&name).unwrap_or_else(|| {
+            panic!(
+                "invalid BACKENDS entry {name:?}: expected one of \
+                 ndarray, flex, libtorch (or `all`)"
+            )
+        });
+        if !backend.is_compiled_in() {
+            let feature = match backend {
+                Backend::Flex => "oracle-flex",
+                Backend::LibTorch => "oracle-tch",
+                Backend::NdArray => unreachable!("NdArray is always compiled in"),
+            };
+            panic!(
+                "BACKENDS requested {name:?}, which this build does not support \
+                 — rebuild with --features {feature}. Available: {:?}",
+                Backend::available().iter().map(|b| b.name()).collect::<Vec<_>>()
+            );
+        }
+        if !selected.contains(&backend) {
+            selected.push(backend);
+        }
+    }
+
+    if selected.is_empty() {
+        panic!("BACKENDS named no usable backend");
+    }
+    selected
+}
+
 // ─── fuzz config ──────────────────────────────────────────────────────────────
 #[derive(Debug, Clone)]
 pub struct FuzzConfig {
@@ -22,6 +135,9 @@ pub struct FuzzConfig {
 
     pub min_dim: usize,
     pub max_dim: usize,
+
+    /// Backends to run and cross-check, reference side first.
+    pub backends: Vec<Backend>,
 }
 
 impl Default for FuzzConfig {
@@ -32,6 +148,7 @@ impl Default for FuzzConfig {
             mode: HarnessMode::PanicOnFirstError,
             min_dim: 1,
             max_dim: 16,
+            backends: Backend::available(),
         }
     }
 }
@@ -76,6 +193,7 @@ impl FuzzConfig {
             mode,
             min_dim,
             max_dim,
+            backends: backends_from_env(),
         }
     }
 }
@@ -214,5 +332,40 @@ impl AutogradProgram {
 impl fmt::Display for AutogradProgram {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.ssa(4))
+    }
+}
+#[cfg(test)]
+mod backend_selection_tests {
+    use super::Backend;
+
+    #[test]
+    fn ndarray_is_always_available() {
+        assert!(Backend::NdArray.is_compiled_in());
+        assert!(Backend::available().contains(&Backend::NdArray));
+    }
+
+    #[test]
+    fn available_lists_reference_side_first() {
+        // LibTorch is the most independently-trustworthy side, so when it is
+        // compiled in it must sort ahead of the burn backends.
+        let available = Backend::available();
+        if available.contains(&Backend::LibTorch) {
+            assert_eq!(available[0], Backend::LibTorch);
+        }
+        assert!(available.iter().all(|b| b.is_compiled_in()));
+    }
+
+    #[test]
+    fn names_round_trip() {
+        for backend in [Backend::NdArray, Backend::Flex, Backend::LibTorch] {
+            assert_eq!(
+                Backend::from_name(backend.name()),
+                Some(backend),
+                "{} must parse back to itself",
+                backend.name()
+            );
+        }
+        assert_eq!(Backend::from_name("tch"), Some(Backend::LibTorch));
+        assert_eq!(Backend::from_name("nonsense"), None);
     }
 }

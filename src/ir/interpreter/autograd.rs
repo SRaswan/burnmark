@@ -4,12 +4,9 @@ use burn::tensor::{Device, Gradients, Tensor};
 
 use super::shape::Shape2;
 use super::shape::after_diff_op;
-use super::{bytes_to_floats, catch_as_result, eval_tensor_instr};
+use super::{assert_agreement, bytes_to_floats, catch_as_result, device_for, eval_tensor_instr};
 use crate::ir::ops::DiffOp;
 use crate::ir::program::{AutogradProgram, FuzzConfig};
-
-#[cfg(feature = "oracle-tch")]
-use super::compare_outputs;
 
 fn make_leaf(raw: &[u8], rows: usize, cols: usize, device: &Device) -> Tensor<2> {
     Tensor::<1>::from_floats(
@@ -122,24 +119,42 @@ fn collect_grads(
         .collect()
 }
 
-/// Run AutogradProgram against the NdArray backend (via autodiff device).
-/// See the note on `run_tensor_program` re: `Device::ndarray()` deprecation.
-#[allow(deprecated)]
+/// Run `prog` on every backend in `config.backends` and require their per-leaf
+/// gradients to agree.  The first entry is the reference side; a single entry
+/// simply executes the program with no comparison.
 pub fn run_autograd_program(prog: &AutogradProgram, config: &FuzzConfig) -> Result<(), String> {
     catch_as_result(std::panic::AssertUnwindSafe(|| {
-        let nd = collect_grads(prog, config, &Device::ndarray().autodiff());
-        #[cfg(feature = "oracle-tch")]
-        run_autograd_oracle(prog, config, nd);
-    }))
-}
+        // `.autodiff()` wraps whichever backend the device selects, so every
+        // entry gets gradient tracking without the interpreter having to know
+        // which backend it is running on.
+        let grads: Vec<(&'static str, Vec<Vec<f32>>)> = config
+            .backends
+            .iter()
+            .map(|&backend| {
+                let device = device_for(backend).autodiff();
+                (backend.name(), collect_grads(prog, config, &device))
+            })
+            .collect();
 
-#[cfg(feature = "oracle-tch")]
-fn run_autograd_oracle(prog: &AutogradProgram, config: &FuzzConfig, nd: Vec<Vec<f32>>) {
-    let lt = collect_grads(prog, config, &Device::libtorch().autodiff());
-    if nd.len() != lt.len() {
-        panic!("oracle leaf count mismatch: NdArray={}, LibTorch={}", nd.len(), lt.len());
-    }
-    for (i, (nd_grad, lt_grad)) in nd.iter().zip(lt.iter()).enumerate() {
-        compare_outputs(nd_grad, lt_grad, &format!("grad r{i}"));
-    }
+        let Some(((ref_name, reference), others)) = grads.split_first() else {
+            return;
+        };
+        for (name, leaves) in others {
+            if leaves.len() != reference.len() {
+                panic!(
+                    "leaf count mismatch: {ref_name}={}, {name}={}",
+                    reference.len(),
+                    leaves.len()
+                );
+            }
+        }
+
+        for leaf in 0..reference.len() {
+            let view: Vec<(&'static str, &[f32])> = grads
+                .iter()
+                .map(|(name, per_leaf)| (*name, per_leaf[leaf].as_slice()))
+                .collect();
+            assert_agreement(&view, &format!("grad r{leaf}"));
+        }
+    }))
 }

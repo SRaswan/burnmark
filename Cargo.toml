@@ -11,6 +11,9 @@ edition = "2024"
 [features]
 default = []
 oracle-tch = ["burn/tch", "dep:tch", "dep:torch-sys"]
+# burn-flex: the non-deprecated pure-Rust CPU backend replacing burn-ndarray.
+# A distinct implementation, not a rename — it disagrees with NdArray in practice.
+oracle-flex = ["burn/flex"]
 
 [dependencies]
 burn = { version = "0.22.0-pre.3", features = ["autodiff", "ndarray"] }
