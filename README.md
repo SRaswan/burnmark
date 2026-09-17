@@ -29,17 +29,32 @@ is the reference** — every other backend is compared against it, and divergenc
 are reported as `<backend> vs <reference>`.
 
 ```bash
-# Build-time availability: ndarray is always in; these add the other two.
-#   --features oracle-tch    → libtorch     --features oracle-flex → flex
+# Build-time availability: ndarray is always in; these add the other three.
+#   --features oracle-tch  → libtorch    --features oracle-flex → flex
+#   --features oracle-cpu  → cpu (CubeCL CPU)
+
+# `cpu` MUST use --sanitizer=none (linkme/ASAN, see Roadmap) and a raised RSS
+# limit (CubeCL's JIT cache grows); without both it dies in under a minute.
+BACKENDS=cpu,flex,ndarray  cargo +nightly fuzz run fuzz_autograd --features oracle-cpu,oracle-flex \
+                             --sanitizer=none -- -rss_limit_mb=8192
+BACKENDS=cpu,libtorch      cargo +nightly fuzz run fuzz_autograd --features oracle-cpu,oracle-tch \
+                             --sanitizer=none -- -rss_limit_mb=8192
 
 BACKENDS=libtorch,ndarray  cargo +nightly fuzz run fuzz_autograd --features oracle-tch
 BACKENDS=libtorch,flex     cargo +nightly fuzz run fuzz_autograd --features oracle-tch,oracle-flex
 BACKENDS=flex,ndarray      cargo +nightly fuzz run fuzz_autograd --features oracle-flex
-BACKENDS=all               cargo +nightly fuzz run fuzz_autograd --features oracle-tch,oracle-flex
+BACKENDS=all               cargo +nightly fuzz run fuzz_autograd --features oracle-tch,oracle-flex,oracle-cpu
 BACKENDS=ndarray           cargo +nightly fuzz run fuzz_autograd   # no comparison; smoke/throughput runs
 ```
 
-Unset `BACKENDS` runs every backend compiled in, reference side first. A
+`BACKENDS=cpu,flex,ndarray` is the useful default once burn-tch is removed: it
+keeps a reference believed correct without depending on a deprecated backend.
+`BACKENDS=cpu,libtorch` is the interesting *new* signal — two independently
+implemented backends both believed correct, so any disagreement between them is
+a finding rather than a known-wrong backend restating a known bug.
+
+Unset `BACKENDS` runs every backend compiled in, reference side first — `cpu`
+when `oracle-cpu` is compiled in, else `libtorch`, else `ndarray` alone. A
 selection naming an unknown backend, or one this build lacks, fails loudly with
 the missing feature named rather than silently comparing fewer backends than
 asked for.
@@ -181,23 +196,30 @@ The work is therefore not in the interpreter. It is in three places:
    forcing a GPU→CPU readback per iteration; that is the throughput ceiling and
    should be measured before a GPU goes anywhere near the hot loop.
 
-Two more things to expect, untested so far: `cargo-fuzz` defaults to ASAN and GPU
-drivers under ASAN are a known false-positive source, so GPU targets will likely
-want `--sanitizer=none`; and the `1e-4` relative tolerance in `compare_outputs`
-is probably too tight for GPU transcendentals (`exp`/`log`/`tanh`/`sigmoid`)
-against LibTorch CPU, so expect false-positive noise until tolerance is per-op.
+Two more things to expect. The first is **no longer a prediction**: `cargo-fuzz`
+defaults to ASAN, and every CubeCL backend does need `--sanitizer=none` — but not
+for the guessed reason. It is not GPU driver false positives; it is `linkme`'s
+dupcheck misfiring under ASAN inside CubeCL's `pliron` compiler layer, which
+means it bites the **CPU** backend too, with no GPU anywhere. Measured detail
+under "The CubeCL CPU backend is now wired in" below. The second is still
+untested: the `1e-4` relative tolerance in `compare_outputs` is probably too
+tight for GPU transcendentals (`exp`/`log`/`tanh`/`sigmoid`) against LibTorch
+CPU, so expect false-positive noise until tolerance is per-op.
 
 **Easiest backend to add right now: `flex()`.** Measured against the
 alternatives on this machine:
 
-| | flex | metal / wgpu | libtorch_mps | cuda / rocm |
-|---|---|---|---|---|
-| New dependencies | `burn/flex` only | cubecl + wgpu + driver stack | **none** (`tch` already on) | — |
-| Cold build | **14 s** | minutes | none | — |
-| Background-thread panics | **0** | 2 shader failures | 0 | — |
-| Needs `OnceLock` / readback / panic hook | **no** | all three | no | — |
-| Differential value | **high** (replaces NdArray) | high (3rd implementation) | low (PyTorch vs PyTorch) | high |
-| Works here | yes | with caveats | yes | no hardware |
+| | flex | cpu (CubeCL) | metal / wgpu | libtorch_mps | cuda / rocm |
+|---|---|---|---|---|---|
+| New dependencies | `burn/flex` only | cubecl, no driver stack | cubecl + wgpu + driver stack | **none** (`tch` already on) | — |
+| Cold build | **14 s** | 1 m 08 s | minutes | none | — |
+| Background-thread panics | **0** | **0** | 2 shader failures | 0 | — |
+| Needs `OnceLock` / readback / panic hook | **no** | **no** | all three | no | — |
+| Runs under ASAN | **yes** | **no** (linkme dupcheck) | untested | yes | — |
+| exec/s (30 s, `-max_len=8`) | untested | 323 | untested | untested | — |
+| RSS over a run | untested | climbs (260→562 Mb) | untested | untested | — |
+| Differential value | **high** (replaces NdArray) | **high** (CubeCL kernels, correct on `sign(NaN)`) | high (3rd implementation) | low (PyTorch vs PyTorch) | high |
+| Works here | yes | yes | with caveats | yes | no hardware |
 
 Because burn-flex is pure-Rust CPU and synchronous, none of the three costs
 above apply to it: device construction is trivial, `into_data()` is not a device
@@ -216,6 +238,65 @@ CubeCL backend a matter of keeping a trustworthy reference at all, not just
 breadth: LibTorch is the best reference available *today*, and that is
 time-limited.
 
+**The CubeCL CPU backend is now wired in**, behind `--features oracle-cpu`, and
+it takes the reference slot ahead of LibTorch — it is the only backend that is
+both measured correct on the `sign(NaN)` case and not deprecated. None of the
+three GPU prerequisites above apply to it: no cross-thread panics to catch, no
+device construction to hoist, no per-op tolerance needed.
+
+It has three costs of its own, though, and all three were measured only by
+actually running it — none was predicted:
+
+1. **It cannot be fuzzed under ASAN**, so every `cpu` run needs
+   `--sanitizer=none`. CubeCL reaches `pliron` (its MLIR-style compiler layer)
+   via `cubecl-cpu` → `cubecl-llvm`, and `pliron` registers dictionary keys with
+   `linkme`'s `#[distributed_slice]`. Under ASAN that panics immediately:
+
+   ```
+   duplicate #[distributed_slice] with name "DICT_KEY_IDS"
+   ```
+
+   This is **not** a burn, CubeCL or pliron bug — it is a `linkme`/ASAN
+   incompatibility, reproducible in a crate with none of them present:
+
+   ```rust
+   #[distributed_slice] pub static THINGS: [&'static str];
+   ```
+   ```
+   cargo run                                  → THINGS = ["a", "b"]
+   RUSTFLAGS="-Zsanitizer=address" cargo run  → duplicate #[distributed_slice]
+   ```
+
+   ASAN pads globals with redzones, which widens the gap between `linkme`'s
+   dupcheck sentinels until its `dupcheck_start + 1 < dupcheck_stop` test fires
+   spuriously (`linkme-0.3.37/src/distributed_slice.rs:231`). Note the cost:
+   `cpu` runs give up the memory-safety sanitizer entirely. Worth knowing before
+   `cpu` becomes the default reference. (`-Clink-dead-code`, cargo-fuzz's other
+   default flag and the more obvious suspect, was tested and is *not* the cause.)
+
+2. **CubeCL JIT-compiles kernels at runtime, so it is ~16× slower and its RSS
+   climbs.** Measured over 30 s on identical settings (`-max_len=8`):
+
+   | | ndarray | cpu |
+   |---|---|---|
+   | exec/s | **5,334** | 323 (degrading: 682 → 409 → 323) |
+   | total execs | 165,361 | 11,317 |
+   | RSS | 97 Mb, flat | 260 → 474 → 562 Mb, climbing |
+
+   The climb is why libFuzzer's default `-rss_limit_mb=2048` kills a `cpu` run
+   within a minute; raise it. Whether RSS plateaus or grows without bound is
+   **not** yet measured — 11k execs was not long enough to tell.
+
+3. **Its coverage signal is dominated by the compiler, not by burn.** The same
+   30 s produced 4,726 coverage points on ndarray and **39,898** on cpu — 8.4×
+   more, because the instrumented JIT is itself being executed. That is not more
+   tensor-op coverage; it means libFuzzer's corpus selection will optimise toward
+   inputs that stress CubeCL's compiler rather than burn's math. Treat `cpu`
+   coverage numbers as incomparable to the other backends'.
+
+`metal()` remains the next one after, once the cross-thread panic hook exists —
+and it will inherit costs 1 and 3, since it shares this CubeCL compiler path.
+
 The probe was worth running on its own account. Gradient of `abs(log(x))` over
 `[-0.5, 0.25, 2.0, -3.0]`, against unpatched published `0.22.0-pre.3`:
 
@@ -224,6 +305,7 @@ The probe was worth running on its own account. Gradient of `abs(log(x))` over
 | `libtorch` | `[-0.0, -4.0, 0.5, -0.0]` | correct — `sign(NaN) == 0` |
 | `libtorch_mps` | `[-0.0, -4.0, 0.5, -0.0]` | correct |
 | `metal` (CubeCL) | `[-0.0, -4.0, 0.5, -0.0]` | correct |
+| `cpu` (CubeCL) | `[-0.0, -4.0, 0.5, -0.0]` | correct — re-measured after wiring it in |
 | `ndarray` | `[-2.0, -4.0, 0.5, -0.33333334]` | wrong: `1/x`, sign taken from the NaN's sign *bit* |
 | `flex` | `[NaN, -4.0, 0.5, NaN]` | wrong: returns the NaN itself |
 

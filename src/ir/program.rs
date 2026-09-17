@@ -29,16 +29,39 @@ pub enum Backend {
     Flex,
     /// LibTorch via `tch`.  A separate project following PyTorch's documented
     /// special-value conventions, which makes it the best available reference.
+    ///
+    /// Deprecated on burn `main` ("burn-tch is deprecated ... use a CubeCL
+    /// backend or `Device::flex()`"), so its days as the reference are numbered.
     LibTorch,
+    /// CubeCL's CPU backend.  Compiles the same kernels as burn-cuda / rocm /
+    /// wgpu and runs them on CPU, so it gives GPU-family coverage with no GPU —
+    /// and unlike a real GPU backend it needs no panic hook, no hoisted device
+    /// construction and no per-op tolerance.  Not deprecated, and measured
+    /// correct on the `sign(NaN)` case the other CPU backends get wrong, which
+    /// is why it takes the reference slot ahead of LibTorch.
+    Cpu,
 }
 
 impl Backend {
+    /// Every backend this fuzzer knows about, most-trustworthy first.
+    ///
+    /// The one place that ordering is written down: [`Backend::available`]
+    /// filters this without reordering, so the reference side is whichever of
+    /// these is compiled in first.
+    pub const ALL: [Backend; 4] = [
+        Backend::Cpu,
+        Backend::LibTorch,
+        Backend::NdArray,
+        Backend::Flex,
+    ];
+
     /// Name used in `BACKENDS` and in divergence reports.
     pub const fn name(self) -> &'static str {
         match self {
             Backend::NdArray => "ndarray",
             Backend::Flex => "flex",
             Backend::LibTorch => "libtorch",
+            Backend::Cpu => "cpu",
         }
     }
 
@@ -47,6 +70,10 @@ impl Backend {
             "ndarray" | "nd" => Some(Backend::NdArray),
             "flex" => Some(Backend::Flex),
             "libtorch" | "tch" | "torch" => Some(Backend::LibTorch),
+            // Not aliased to bare "cubecl": metal/cuda/rocm/wgpu are CubeCL
+            // backends too, so that name will be ambiguous the moment a second
+            // one is wired in.
+            "cpu" | "cubecl-cpu" => Some(Backend::Cpu),
             _ => None,
         }
     }
@@ -57,12 +84,18 @@ impl Backend {
             Backend::NdArray => true,
             Backend::Flex => cfg!(feature = "oracle-flex"),
             Backend::LibTorch => cfg!(feature = "oracle-tch"),
+            Backend::Cpu => cfg!(feature = "oracle-cpu"),
         }
     }
 
     /// Every backend this build can run, most-trustworthy first.
+    ///
+    /// This ordering *is* the default reference choice whenever `BACKENDS` is
+    /// unset, so it leads with the backends both believed correct and not
+    /// deprecated: CubeCL CPU first, then LibTorch — correct, but deprecated on
+    /// burn `main` — then the two CPU backends known to be wrong on `sign(NaN)`.
     pub fn available() -> Vec<Self> {
-        [Backend::LibTorch, Backend::NdArray, Backend::Flex]
+        Backend::ALL
             .into_iter()
             .filter(|b| b.is_compiled_in())
             .collect()
@@ -73,10 +106,10 @@ impl Backend {
 /// against the first, and divergences are reported as `<backend> vs <reference>`.
 ///
 /// Parsed from `BACKENDS`: a comma-separated list of names, or `all`.  Unset
-/// keeps the historical pairing (LibTorch as reference against NdArray when
-/// `oracle-tch` is compiled in, NdArray alone otherwise) so existing corpora and
-/// artifacts stay comparable.  A single entry runs the program without any
-/// comparison, which is useful for smoke and throughput runs.
+/// runs every backend compiled in, in [`Backend::available`]'s order — so the
+/// reference is CubeCL CPU when `oracle-cpu` is compiled in, LibTorch when it is
+/// not, and NdArray alone in a default build.  A single entry runs the program
+/// without any comparison, which is useful for smoke and throughput runs.
 ///
 /// An unparseable or unavailable selection panics rather than silently dropping
 /// a requested side: quietly comparing fewer backends than asked for would
@@ -98,13 +131,14 @@ pub fn backends_from_env() -> Vec<Backend> {
         let backend = Backend::from_name(&name).unwrap_or_else(|| {
             panic!(
                 "invalid BACKENDS entry {name:?}: expected one of \
-                 ndarray, flex, libtorch (or `all`)"
+                 ndarray, flex, libtorch, cpu (or `all`)"
             )
         });
         if !backend.is_compiled_in() {
             let feature = match backend {
                 Backend::Flex => "oracle-flex",
                 Backend::LibTorch => "oracle-tch",
+                Backend::Cpu => "oracle-cpu",
                 Backend::NdArray => unreachable!("NdArray is always compiled in"),
             };
             panic!(
@@ -346,18 +380,31 @@ mod backend_selection_tests {
 
     #[test]
     fn available_lists_reference_side_first() {
-        // LibTorch is the most independently-trustworthy side, so when it is
-        // compiled in it must sort ahead of the burn backends.
+        // The head of this list is the default reference side, so it must be a
+        // backend believed correct: CubeCL CPU when compiled in, else LibTorch.
+        // Both are measured correct on `sign(NaN)`; NdArray and Flex are not.
         let available = Backend::available();
-        if available.contains(&Backend::LibTorch) {
+        if available.contains(&Backend::Cpu) {
+            assert_eq!(available[0], Backend::Cpu);
+        } else if available.contains(&Backend::LibTorch) {
             assert_eq!(available[0], Backend::LibTorch);
         }
         assert!(available.iter().all(|b| b.is_compiled_in()));
     }
 
     #[test]
+    fn cpu_outranks_libtorch_as_reference() {
+        // burn-tch is deprecated on burn `main`; CubeCL CPU is not.  When both
+        // are compiled in, CPU must take the reference slot — this is the
+        // ordering that survives burn-tch's removal.
+        let order = |b| Backend::ALL.iter().position(|x| *x == b);
+        assert!(order(Backend::Cpu) < order(Backend::LibTorch));
+        assert!(order(Backend::LibTorch) < order(Backend::NdArray));
+    }
+
+    #[test]
     fn names_round_trip() {
-        for backend in [Backend::NdArray, Backend::Flex, Backend::LibTorch] {
+        for backend in Backend::ALL {
             assert_eq!(
                 Backend::from_name(backend.name()),
                 Some(backend),
@@ -366,6 +413,7 @@ mod backend_selection_tests {
             );
         }
         assert_eq!(Backend::from_name("tch"), Some(Backend::LibTorch));
+        assert_eq!(Backend::from_name("cubecl-cpu"), Some(Backend::Cpu));
         assert_eq!(Backend::from_name("nonsense"), None);
     }
 }

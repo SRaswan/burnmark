@@ -14,6 +14,12 @@ oracle-tch = ["burn/tch", "dep:tch", "dep:torch-sys"]
 # burn-flex: the non-deprecated pure-Rust CPU backend replacing burn-ndarray.
 # A distinct implementation, not a rename — it disagrees with NdArray in practice.
 oracle-flex = ["burn/flex"]
+# CubeCL CPU: the same kernel path burn-cuda / rocm / wgpu compile, run on CPU.
+# Non-deprecated, and the only backend besides LibTorch measured correct on the
+# sign(NaN) case — so it is the reference side once burn-tch goes. Drop-in: no
+# GPU prerequisites (no cross-thread panics, trivial device construction), the
+# only cost being CubeCL's build time.
+oracle-cpu = ["burn/cpu"]
 
 [dependencies]
 burn = { version = "0.22.0-pre.3", features = ["autodiff", "ndarray"] }

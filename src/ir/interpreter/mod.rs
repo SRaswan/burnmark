@@ -70,6 +70,8 @@ fn device_for(backend: Backend) -> Device {
         Backend::Flex => Device::flex(),
         #[cfg(feature = "oracle-tch")]
         Backend::LibTorch => Device::libtorch(),
+        #[cfg(feature = "oracle-cpu")]
+        Backend::Cpu => Device::cpu(),
         #[allow(unreachable_patterns)]
         unavailable => panic!(
             "backend {} is not compiled into this build",
