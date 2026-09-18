@@ -3,10 +3,15 @@
 //! This is the crate's second *tensor-producing* consumer of [`TensorInstr`],
 //! and its first non-burn one.  `eval_tensor_instr_tch` is a **sibling** of
 //! `eval_tensor_instr`, not a generic version of it: a new consumer of the IR
-//! is a new `match`, not a new trait.  At two targets, two concrete
-//! interpreters read better than one generic one, and the IR, the generator,
-//! shape propagation, `values_diverge` and target selection all carry over
-//! untouched.
+//! is a new `match`, not a new trait, and the IR, the generator, shape
+//! propagation, `values_diverge` and target selection all carry over untouched.
+//!
+//! The SSA walk *around* that match is shared — see
+//! [`driver`](super::driver), which owns the register file, the leaf
+//! bookkeeping and the `exceeds_cap` break for every target.  That is a
+//! deliberately different boundary from a trait over the instruction set: the
+//! 22 arms below stay a free function, because every one of them is
+//! irreducibly per-framework.
 //!
 //! # Why this target exists
 //!
@@ -45,17 +50,18 @@
 //!   what `after_tensor_instr` predicts and what burn-tch passes.
 //! * `Repeat` is *tile* semantics (`[a,b] ×2 → [a,b,a,b]`), which is what both
 //!   burn's `repeat_dim` and libtorch's `repeat` do — not `repeat_interleave`.
-//! * `backward()` is seeded with ones (see [`collect_grads`]).
+//! * `backward()` is seeded with ones — see [`TchRaw::backward`], which has to
+//!   sum the root first because libtorch refuses a non-scalar one.
 
 use tch::{Kind, Tensor};
 
 use super::bytes_to_floats;
+use super::driver::Framework;
 use super::shape::{
-    Shape2, after_diff_op, after_tensor_instr, resolve_broadcast_compatible,
-    resolve_concat_compatible, resolve_matmul_compatible,
+    Shape2, resolve_broadcast_compatible, resolve_concat_compatible,
+    resolve_matmul_compatible,
 };
-use crate::ir::ops::{DiffOp, POWF_EXPONENTS, TensorInstr};
-use crate::ir::program::{AutogradProgram, FuzzConfig, TensorProgram};
+use crate::ir::ops::{POWF_EXPONENTS, TensorInstr};
 
 /// Every tensor here is `f32`, matching burn's `Tensor<2>`.
 const KIND: Kind = Kind::Float;
@@ -167,128 +173,68 @@ fn eval_tensor_instr_tch(regs: &[Tensor], shapes: &[Shape2], instr: &TensorInstr
     }
 }
 
-// ─── program runners ─────────────────────────────────────────────────────────
+// ─── the `Framework` impl ────────────────────────────────────────────────────
 
-/// Run a plain SSA [`TensorProgram`] against libtorch directly.
+/// Raw tch-rs as a target.
 ///
-/// Mirrors the burn path in `tensor_program.rs` step for step, including the
-/// `exceeds_cap` break — the two must stop at the same instruction or they
-/// would compare different programs.
-pub(super) fn eval_tensor_program(prog: &TensorProgram) -> Vec<f32> {
-    let rows = (prog.rows as usize).clamp(1, 16);
-    let cols = (prog.cols as usize).clamp(1, 16);
+/// Stateless: libtorch's CPU device needs no handle, so there is nothing to
+/// carry.  The SSA walk — register file, leaf bookkeeping, `exceeds_cap` break,
+/// aliasing — lives in [`driver`](super::driver) and is shared with every other
+/// target, which is what guarantees this target and burn run the *same*
+/// program.
+pub(super) struct TchRaw;
 
-    let mut regs: Vec<Tensor> = vec![make_tensor(&prog.values, rows, cols, false)];
-    let mut shapes: Vec<Shape2> = vec![Shape2(rows, cols)];
+impl Framework for TchRaw {
+    type Tensor = Tensor;
+    /// libtorch has no gradient store: `backward()` writes gradients onto the
+    /// leaf tensors themselves, and [`Framework::grad`] reads them back off.
+    type Grads = ();
 
-    for instr in &prog.ops {
-        let out_shape = after_tensor_instr(&shapes, instr);
-        if out_shape.exceeds_cap() {
-            break;
-        }
-        let val = eval_tensor_instr_tch(&regs, &shapes, instr);
-        regs.push(val);
-        shapes.push(out_shape);
+    fn input(&self, raw: &[u8], rows: usize, cols: usize) -> Tensor {
+        make_tensor(raw, rows, cols, false)
     }
 
-    to_vec(&regs.pop().expect("register file is empty"))
-}
-
-/// Run an [`AutogradProgram`] against libtorch directly, returning gradient data
-/// for every leaf in introduction order.
-///
-/// # The backward seed
-///
-/// burn's `backward()` seeds the root gradient with **ones of the root's
-/// shape** (`Gradients::new_with_hook` registers `float_ones`), while
-/// libtorch's `backward()` refuses a non-scalar root outright.  Summing the
-/// root first is exactly that ones-seed — `d(Σy)/dx == Σᵢ ∂yᵢ/∂x · 1` — so the
-/// two halves stay comparable.  Reducing any other way (mean, first element)
-/// would silently rescale every gradient and make every comparison wrong.
-///
-/// A root that does not track gradients is left to fail here rather than being
-/// guarded: burn panics in that situation too ("Tensor::backward requires a
-/// tracked autodiff tensor"), and that panic *was* a real bug — `powf_scalar(0)`
-/// detaching from the graph. A guard would hide exactly that class.
-pub(super) fn collect_grads(prog: &AutogradProgram, config: &FuzzConfig) -> Vec<Vec<f32>> {
-    let rows = (prog.rows as usize).clamp(1, 16);
-    let cols = (prog.cols as usize).clamp(1, 16);
-
-    let leaf_0 = make_tensor(
-        prog.leaf_seeds.first().map(Vec::as_slice).unwrap_or(&[]),
-        rows,
-        cols,
-        true,
-    );
-    let mut regs: Vec<Tensor> = vec![leaf_0];
-    let mut shapes: Vec<Shape2> = vec![Shape2(rows, cols)];
-    let mut leaf_indices: Vec<usize> = vec![0];
-    let mut leaf_shapes: Vec<(usize, usize)> = vec![(rows, cols)];
-    let mut leaf_count: usize = 1;
-
-    for op in &prog.ops {
-        let (val, out_shape) = match op {
-            DiffOp::Leaf { seed, rows: lr, cols: lc } => {
-                if leaf_count < config.max_leaves {
-                    let pool_idx = if prog.leaf_seeds.is_empty() {
-                        0
-                    } else {
-                        *seed as usize % prog.leaf_seeds.len()
-                    };
-                    let raw = prog
-                        .leaf_seeds
-                        .get(pool_idx)
-                        .map(Vec::as_slice)
-                        .unwrap_or(&[]);
-                    let leaf_rows = (*lr as usize).clamp(1, 16);
-                    let leaf_cols = (*lc as usize).clamp(1, 16);
-                    let leaf = make_tensor(raw, leaf_rows, leaf_cols, true);
-                    leaf_indices.push(regs.len());
-                    leaf_shapes.push((leaf_rows, leaf_cols));
-                    leaf_count += 1;
-                    (leaf, Shape2(leaf_rows, leaf_cols))
-                } else {
-                    // Leaf cap reached: alias an existing register.  A shallow
-                    // clone shares the autograd node, exactly as burn's
-                    // `Tensor::clone` does, so gradients still reach the
-                    // original leaf.
-                    let alias_idx = (*seed as usize) % regs.len();
-                    (regs[alias_idx].shallow_clone(), shapes[alias_idx])
-                }
-            }
-            _ => {
-                let out_shape =
-                    after_diff_op(&shapes, op).expect("non-Leaf op returned None shape");
-                if out_shape.exceeds_cap() {
-                    break;
-                }
-                let DiffOp::Instr(instr) = op else {
-                    unreachable!("Leaf handled above")
-                };
-                (eval_tensor_instr_tch(&regs, &shapes, instr), out_shape)
-            }
-        };
-        regs.push(val);
-        shapes.push(out_shape);
+    fn leaf(&self, raw: &[u8], rows: usize, cols: usize) -> Tensor {
+        make_tensor(raw, rows, cols, true)
     }
 
-    let last = regs.last().expect("register file is empty").shallow_clone();
-    last.sum(KIND).backward();
+    fn alias(&self, tensor: &Tensor) -> Tensor {
+        // `shallow_clone` specifically: it shares the autograd node, matching
+        // burn's `Tensor::clone`.  `tch::Tensor` has no `Clone` impl at all, so
+        // there is no wrong-by-default option here — but a `copy()` would be
+        // wrong, and would only show up in programs that hit the leaf cap.
+        tensor.shallow_clone()
+    }
 
-    leaf_indices
-        .iter()
-        .zip(leaf_shapes.iter())
-        .map(|(&ri, &(lr, lc))| {
-            let grad = regs[ri].grad();
-            // An undefined grad is libtorch's `None`: the leaf never reached
-            // the root.  burn reports the same case as zeros.
-            if grad.defined() {
-                to_vec(&grad)
-            } else {
-                vec![0.0_f32; lr * lc]
-            }
-        })
-        .collect()
+    fn eval(&self, regs: &[Tensor], shapes: &[Shape2], instr: &TensorInstr) -> Tensor {
+        eval_tensor_instr_tch(regs, shapes, instr)
+    }
+
+    /// # The backward seed
+    ///
+    /// burn seeds the root gradient with **ones of the root's shape**, while
+    /// libtorch refuses a non-scalar root outright.  Summing the root first is
+    /// exactly that ones-seed — `d(Σy)/dx == Σᵢ ∂yᵢ/∂x · 1` — so the two halves
+    /// stay comparable.  Reducing any other way (mean, first element) would
+    /// silently rescale every gradient and make every comparison wrong.
+    ///
+    /// A root that does not track gradients is left to fail here rather than
+    /// being guarded: burn panics in that situation too, and that panic *was*
+    /// bug #3 — `powf_scalar(0)` detaching from the graph.
+    fn backward(&self, root: &Tensor) {
+        root.sum(KIND).backward()
+    }
+
+    fn grad(&self, _grads: &(), leaf: &Tensor) -> Option<Tensor> {
+        let grad = leaf.grad();
+        // An undefined grad is libtorch's `None`: the leaf never reached the
+        // root.  The driver reports that as zeros, which is what burn does.
+        if grad.defined() { Some(grad) } else { None }
+    }
+
+    fn to_vec(&self, tensor: &Tensor) -> Vec<f32> {
+        to_vec(tensor)
+    }
 }
 
 // ─── fidelity tests ──────────────────────────────────────────────────────────

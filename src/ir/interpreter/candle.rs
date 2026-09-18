@@ -76,15 +76,16 @@
 //! refuses a non-scalar root and forced `tch_raw` to sum first.  Nothing here
 //! rescales anything.
 
+use candle_core::backprop::GradStore;
 use candle_core::{Device, Result, Tensor, Var};
 
 use super::bytes_to_floats;
+use super::driver::Framework;
 use super::shape::{
-    Shape2, after_diff_op, after_tensor_instr, resolve_broadcast_compatible,
-    resolve_concat_compatible, resolve_matmul_compatible,
+    Shape2, resolve_broadcast_compatible, resolve_concat_compatible,
+    resolve_matmul_compatible,
 };
-use crate::ir::ops::{DiffOp, POWF_EXPONENTS, TensorInstr};
-use crate::ir::program::{AutogradProgram, FuzzConfig, TensorProgram};
+use crate::ir::ops::{POWF_EXPONENTS, TensorInstr};
 
 /// candle's CPU device.  Cheap to construct (a unit enum variant), so unlike a
 /// real GPU backend there is nothing to hoist out of the per-iteration path.
@@ -248,127 +249,67 @@ fn eval_or_panic(regs: &[Tensor], shapes: &[Shape2], instr: &TensorInstr) -> Ten
     })
 }
 
-// ─── program runners ─────────────────────────────────────────────────────────
+// ─── the `Framework` impl ────────────────────────────────────────────────────
 
-/// Run a plain SSA [`TensorProgram`] against candle.
+/// candle as a target.
 ///
-/// Mirrors the burn path in `tensor_program.rs` step for step, including the
-/// `exceeds_cap` break — the two must stop at the same instruction or they
-/// would compare different programs.
-pub(super) fn eval_tensor_program(prog: &TensorProgram) -> Vec<f32> {
-    let rows = (prog.rows as usize).clamp(1, 16);
-    let cols = (prog.cols as usize).clamp(1, 16);
+/// Stateless: [`DEVICE`] is a unit enum variant, so there is nothing to carry.
+/// The SSA walk — register file, leaf bookkeeping, `exceeds_cap` break,
+/// aliasing — lives in [`driver`](super::driver) and is shared with every other
+/// target, which is what guarantees this target and burn run the *same*
+/// program.
+pub(super) struct Candle;
 
-    let mut regs: Vec<Tensor> = vec![make_tensor(&prog.values, rows, cols)];
-    let mut shapes: Vec<Shape2> = vec![Shape2(rows, cols)];
+impl Framework for Candle {
+    type Tensor = Tensor;
+    type Grads = GradStore;
 
-    for instr in &prog.ops {
-        let out_shape = after_tensor_instr(&shapes, instr);
-        if out_shape.exceeds_cap() {
-            break;
-        }
-        let val = eval_or_panic(&regs, &shapes, instr);
-        regs.push(val);
-        shapes.push(out_shape);
+    fn input(&self, raw: &[u8], rows: usize, cols: usize) -> Tensor {
+        make_tensor(raw, rows, cols)
     }
 
-    to_vec(&regs.pop().expect("register file is empty"))
-}
-
-/// Run an [`AutogradProgram`] against candle, returning gradient data for every
-/// leaf in introduction order.
-///
-/// # The backward seed
-///
-/// Nothing to reconcile here, unlike the tch side: candle seeds the root
-/// gradient with `ones_like()` of the root and burn seeds it with `float_ones`
-/// of the root, so both halves already mean the same thing by `backward()`.
-///
-/// A root that does not track gradients is left alone rather than guarded.
-/// burn panics in that situation ("Tensor::backward requires a tracked autodiff
-/// tensor") and that panic *was* a real bug — `powf_scalar(0)` detaching from
-/// the graph, bug #3.  candle simply returns the ones-seed and no gradient for
-/// the leaf, which is a divergence this target should *report*; a guard on
-/// either side would hide exactly that class.
-pub(super) fn collect_grads(prog: &AutogradProgram, config: &FuzzConfig) -> Vec<Vec<f32>> {
-    let rows = (prog.rows as usize).clamp(1, 16);
-    let cols = (prog.cols as usize).clamp(1, 16);
-
-    let leaf_0 = make_leaf(
-        prog.leaf_seeds.first().map(Vec::as_slice).unwrap_or(&[]),
-        rows,
-        cols,
-    );
-    let mut regs: Vec<Tensor> = vec![leaf_0];
-    let mut shapes: Vec<Shape2> = vec![Shape2(rows, cols)];
-    let mut leaf_indices: Vec<usize> = vec![0];
-    let mut leaf_shapes: Vec<(usize, usize)> = vec![(rows, cols)];
-    let mut leaf_count: usize = 1;
-
-    for op in &prog.ops {
-        let (val, out_shape) = match op {
-            DiffOp::Leaf { seed, rows: lr, cols: lc } => {
-                if leaf_count < config.max_leaves {
-                    let pool_idx = if prog.leaf_seeds.is_empty() {
-                        0
-                    } else {
-                        *seed as usize % prog.leaf_seeds.len()
-                    };
-                    let raw = prog
-                        .leaf_seeds
-                        .get(pool_idx)
-                        .map(Vec::as_slice)
-                        .unwrap_or(&[]);
-                    let leaf_rows = (*lr as usize).clamp(1, 16);
-                    let leaf_cols = (*lc as usize).clamp(1, 16);
-                    let leaf = make_leaf(raw, leaf_rows, leaf_cols);
-                    leaf_indices.push(regs.len());
-                    leaf_shapes.push((leaf_rows, leaf_cols));
-                    leaf_count += 1;
-                    (leaf, Shape2(leaf_rows, leaf_cols))
-                } else {
-                    // Leaf cap reached: alias an existing register.  candle's
-                    // `Tensor` is an `Arc` over shared state, so a clone keeps
-                    // the same `TensorId` and therefore the same gradient
-                    // entry — exactly what burn's `Tensor::clone` and tch's
-                    // `shallow_clone` do.  A copy would make the aliased leaf's
-                    // gradient come back short.
-                    let alias_idx = (*seed as usize) % regs.len();
-                    (regs[alias_idx].clone(), shapes[alias_idx])
-                }
-            }
-            _ => {
-                let out_shape =
-                    after_diff_op(&shapes, op).expect("non-Leaf op returned None shape");
-                if out_shape.exceeds_cap() {
-                    break;
-                }
-                let DiffOp::Instr(instr) = op else {
-                    unreachable!("Leaf handled above")
-                };
-                (eval_or_panic(&regs, &shapes, instr), out_shape)
-            }
-        };
-        regs.push(val);
-        shapes.push(out_shape);
+    fn leaf(&self, raw: &[u8], rows: usize, cols: usize) -> Tensor {
+        make_leaf(raw, rows, cols)
     }
 
-    let last = regs.last().expect("register file is empty").clone();
-    let grads = last
-        .backward()
-        .unwrap_or_else(|e| panic!("candle backward failed: {e}"));
+    fn alias(&self, tensor: &Tensor) -> Tensor {
+        // candle's `Tensor` is an `Arc` over shared state, so a clone keeps the
+        // same `TensorId` and therefore resolves to the same `GradStore` entry
+        // — exactly what `alias` requires, and what burn's `Tensor::clone` and
+        // tch's `shallow_clone` do.  A `copy()` would be wrong.
+        tensor.clone()
+    }
 
-    leaf_indices
-        .iter()
-        .zip(leaf_shapes.iter())
-        .map(|(&ri, &(lr, lc))| match grads.get(&regs[ri]) {
-            Some(g) => to_vec(g),
-            // No entry in the store is candle's way of saying the leaf never
-            // reached the root.  burn reports the same case as `None`, which
-            // `autograd.rs` turns into zeros.
-            None => vec![0.0_f32; lr * lc],
-        })
-        .collect()
+    fn eval(&self, regs: &[Tensor], shapes: &[Shape2], instr: &TensorInstr) -> Tensor {
+        eval_or_panic(regs, shapes, instr)
+    }
+
+    /// # The backward seed
+    ///
+    /// Nothing to reconcile here, unlike the tch side: candle seeds the root
+    /// gradient with `ones_like()` of the root and burn seeds it with
+    /// `float_ones` of the root, so both already mean the same thing by
+    /// `backward()`.  Nothing rescales.
+    ///
+    /// A root that does not track gradients is not guarded.  burn panics there
+    /// ("Tensor::backward requires a tracked autodiff tensor") and that panic
+    /// *was* bug #3 — `powf_scalar(0)` detaching from the graph.  candle simply
+    /// returns the ones-seed and no gradient for the leaf, which is a divergence
+    /// this target should *report*; a guard on either side would hide the class.
+    fn backward(&self, root: &Tensor) -> GradStore {
+        root.backward()
+            .unwrap_or_else(|e| panic!("candle backward failed: {e}"))
+    }
+
+    fn grad(&self, grads: &GradStore, leaf: &Tensor) -> Option<Tensor> {
+        // An absent entry is candle's way of saying the leaf never reached the
+        // root.  The driver reports that as zeros, which is what burn does.
+        grads.get(leaf).cloned()
+    }
+
+    fn to_vec(&self, tensor: &Tensor) -> Vec<f32> {
+        to_vec(tensor)
+    }
 }
 
 // ─── fidelity tests ──────────────────────────────────────────────────────────
@@ -388,26 +329,25 @@ pub(super) fn collect_grads(prog: &AutogradProgram, config: &FuzzConfig) -> Vec<
 ///
 /// So the translation is pinned in two narrower ways instead:
 ///
-/// * **Shapes, exhaustively and unconditionally.**  Every instruction's actual
-///   output shape must equal what `after_tensor_instr` predicted, isolated and
-///   chained.  This is pure translation — no arithmetic is involved — and it is
-///   where a wrong `keepdim`, a squeezed whole-tensor reduction, a transposed
-///   `repeat` factor or a rank-0 root would show up.  It needs no other target
-///   compiled in.
+/// * **Shapes, exhaustively and unconditionally** — the tests directly below.
+///   Every instruction's actual output shape must equal what
+///   `after_tensor_instr` predicted, isolated and chained.  This is pure
+///   translation, no arithmetic involved, and it is where a wrong `keepdim`, a
+///   squeezed whole-tensor reduction, a transposed `repeat` factor or a rank-0
+///   root would show up.  It needs no other target compiled in.
 /// * **Values, on inputs where the implementations have nothing to disagree
-///   about.**  [`WELL_BEHAVED`] is strictly positive and bounded away from 0 and
-///   1, so every one of the 22 instructions — `log`, `sqrt`, every exponent in
-///   `POWF_EXPONENTS`, the `Div` that would otherwise divide by zero — stays
-///   finite and smooth.  On that input a divergence from libtorch is a
-///   translation error with high probability, not a special-value opinion.
+///   about** — the [`against_libtorch`](matches_burn::against_libtorch)
+///   submodule.  [`WELL_BEHAVED`](matches_burn::WELL_BEHAVED) is strictly
+///   positive and bounded away from 0 and 1, so every one of the 22
+///   instructions — `log`, `sqrt`, every exponent in `POWF_EXPONENTS`, the
+///   `Div` that would otherwise divide by zero — stays finite and smooth.
 ///
 /// Anything outside that is deliberately left to the fuzzer to report.
 #[cfg(test)]
 mod matches_burn {
     use super::*;
-    use crate::ir::interpreter::{run_autograd_program, run_tensor_program};
-    use crate::ir::ops::{DiffOp, Reg};
-    use crate::ir::program::{Backend, Target};
+    use crate::ir::interpreter::shape::after_tensor_instr;
+    use crate::ir::ops::Reg;
 
     /// Strictly positive, bounded away from 0 and 1, all distinct.
     ///
@@ -415,18 +355,11 @@ mod matches_burn {
     /// `(0, 1)`.  Distinctness matters for `Repeat`: a tile and an interleave of
     /// a constant are the same tensor, so a uniform seed would not tell them
     /// apart.
-    const WELL_BEHAVED: [u8; 9] = [160, 176, 192, 208, 224, 240, 255, 144, 200];
-
-    fn config(reference: Target) -> FuzzConfig {
-        FuzzConfig {
-            targets: vec![reference, Target::Candle],
-            ..FuzzConfig::default()
-        }
-    }
+    pub(super) const WELL_BEHAVED: [u8; 9] = [160, 176, 192, 208, 224, 240, 255, 144, 200];
 
     /// Every [`TensorInstr`] variant, on a square `r0` so that matmul, concat
     /// and transpose are all legal without operand fixup.
-    fn every_instruction() -> Vec<TensorInstr> {
+    pub(super) fn every_instruction() -> Vec<TensorInstr> {
         let r = Reg(0);
         let mut all = vec![
             TensorInstr::Add(r, r),
@@ -466,8 +399,8 @@ mod matches_burn {
     /// actually produced has the shape `after_tensor_instr` predicted.
     ///
     /// The predicted shape — not the observed one — is what gets pushed into
-    /// `shapes`, exactly as the real interpreter does, so a silent drift would
-    /// compound rather than self-correct.
+    /// `shapes`, exactly as the driver does, so a silent drift would compound
+    /// rather than self-correct.
     fn assert_shapes_match_prediction(ops: &[TensorInstr], rows: usize, cols: usize) {
         let mut regs = vec![make_tensor(&WELL_BEHAVED, rows, cols)];
         let mut shapes = vec![Shape2(rows, cols)];
@@ -530,152 +463,173 @@ mod matches_burn {
         );
     }
 
-    // ── value agreement, against libtorch ────────────────────────────────────
-    //
-    // Gated on `oracle-tch` because libtorch is the strongest reference
-    // available and the one whose special-value conventions the rest are judged
-    // against.  burn's CPU backends are deliberately *not* used here: two of
-    // them are known wrong on `sign(NaN)` (bug #2) and `recip` on aarch64 is
-    // ~0.2% off in the published macerator (bug #1), so a failure against them
-    // would be ambiguous between this file and a known burn bug.
-
-    fn assert_forward_agrees(ops: Vec<TensorInstr>, what: &str) {
-        let prog = TensorProgram {
-            rows: 3,
-            cols: 3,
-            values: WELL_BEHAVED.to_vec(),
-            ops,
-        };
-        let config = config(Target::Burn(Backend::LibTorch));
-        if let Err(msg) = run_tensor_program(&prog, &config) {
-            panic!("forward divergence from libtorch for {what}:\n{prog}\n{msg}");
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "oracle-tch")]
-    fn forward_matches_libtorch_for_every_instruction() {
-        for instr in every_instruction() {
-            let line = instr.ssa_line("r1", 1);
-            assert_forward_agrees(vec![instr], &line);
-        }
-    }
-
-    /// Chained, so each op must also agree about what it *received*.  A
-    /// transpose leaves a strided view in candle as it does in libtorch, which
-    /// is the case a missing `contiguous()` on the way out — or into `matmul` —
-    /// would silently reorder, invisible to the isolated tests above.
-    #[test]
-    #[cfg(feature = "oracle-tch")]
-    fn forward_matches_libtorch_chained_onto_a_transpose() {
-        for instr in every_instruction() {
-            let line = instr.ssa_line("r2", 2);
-            assert_forward_agrees(
-                vec![TensorInstr::Transpose(Reg(0)), instr],
-                &format!("r1 = r0.T; {line}"),
-            );
-        }
-    }
-
-    /// The gradient *plumbing* — leaf introduction, aliasing, unreachable
-    /// leaves, and the seed at the root.  An error in any of those would
-    /// corrupt every gradient this target ever reports rather than produce one
-    /// real finding, so unlike per-op derivative agreement it is asserted.
-    #[cfg(feature = "oracle-tch")]
-    fn assert_backward_plumbing_agrees(ops: Vec<DiffOp>, what: &str) {
-        let config = config(Target::Burn(Backend::LibTorch));
-        let prog = AutogradProgram {
-            rows: 3,
-            cols: 3,
-            leaf_seeds: vec![
-                WELL_BEHAVED.to_vec(),
-                WELL_BEHAVED.iter().rev().copied().collect(),
-            ],
-            ops,
-        };
-        if let Err(msg) = run_autograd_program(&prog, &config) {
-            panic!(
-                "gradient plumbing mismatch for {what}:\n{}\n{msg}",
-                prog.ssa(config.max_leaves)
-            );
-        }
-    }
-
-    /// burn and candle both seed the root gradient with ones of the root's
-    /// shape, so unlike `tch_raw` there is no reduction to get wrong here —
-    /// which is exactly why it is worth an assertion: "nothing to do" is a
-    /// claim, and a root whose shape differs from the leaf's is where a wrong
-    /// one would show.
+    /// Value agreement, against libtorch.
     ///
-    /// `Repeat` is safe to include despite bug #5 — burn's `repeat_dim`
-    /// backward regroups the incoming gradient as though the forward had
-    /// interleaved, but the incoming gradient *is* the ones-seed here, and every
-    /// regrouping of ones sums to the same thing.  The bug needs a non-uniform
-    /// gradient to become visible, which is the fuzzer's job, not this test's.
-    #[test]
+    /// Gated on `oracle-tch` because libtorch is the strongest reference
+    /// available and the one whose special-value conventions the rest are judged
+    /// against.  burn's CPU backends are deliberately **not** used here: two of
+    /// them are known wrong on `sign(NaN)` (bug #2) and `recip` on aarch64 is
+    /// ~0.2% off in the published macerator (bug #1), so a failure against them
+    /// would be ambiguous between this file and a known burn bug.
+    ///
+    /// On [`WELL_BEHAVED`] input a divergence from libtorch is a translation
+    /// error with high probability, not a special-value opinion — which is what
+    /// makes these assertable at all between two independent implementations.
     #[cfg(feature = "oracle-tch")]
-    fn backward_seed_matches_for_shape_changing_roots() {
-        for root in [
-            TensorInstr::SumAll(Reg(1)),
-            TensorInstr::MeanAll(Reg(1)),
-            TensorInstr::SumDim(Reg(1), 0),
-            TensorInstr::MeanDim(Reg(1), 1),
-            TensorInstr::Transpose(Reg(1)),
-            TensorInstr::Concat(Reg(1), Reg(1), 0),
-            TensorInstr::Repeat(Reg(1), 1, 3),
-            TensorInstr::Matmul(Reg(1), Reg(1)),
-        ] {
-            let line = root.ssa_line("r2", 2);
+    mod against_libtorch {
+        use super::*;
+        use crate::ir::interpreter::{run_autograd_program, run_tensor_program};
+        use crate::ir::ops::DiffOp;
+        use crate::ir::program::{AutogradProgram, Backend, FuzzConfig, Target, TensorProgram};
+
+        fn config() -> FuzzConfig {
+            FuzzConfig {
+                targets: vec![Target::Burn(Backend::LibTorch), Target::Candle],
+                ..FuzzConfig::default()
+            }
+        }
+
+        fn assert_forward_agrees(ops: Vec<TensorInstr>, what: &str) {
+            let prog = TensorProgram {
+                rows: 3,
+                cols: 3,
+                values: WELL_BEHAVED.to_vec(),
+                ops,
+            };
+            if let Err(msg) = run_tensor_program(&prog, &config()) {
+                panic!("forward divergence from libtorch for {what}:\n{prog}\n{msg}");
+            }
+        }
+
+        #[test]
+        fn forward_matches_libtorch_for_every_instruction() {
+            for instr in every_instruction() {
+                let line = instr.ssa_line("r1", 1);
+                assert_forward_agrees(vec![instr], &line);
+            }
+        }
+
+        /// Chained, so each op must also agree about what it *received*.  A
+        /// transpose leaves a strided view in candle as it does in libtorch,
+        /// which is the case a missing `contiguous()` on the way out — or into
+        /// `matmul` — would silently reorder, invisible to the isolated tests
+        /// above.
+        #[test]
+        fn forward_matches_libtorch_chained_onto_a_transpose() {
+            for instr in every_instruction() {
+                let line = instr.ssa_line("r2", 2);
+                assert_forward_agrees(
+                    vec![TensorInstr::Transpose(Reg(0)), instr],
+                    &format!("r1 = r0.T; {line}"),
+                );
+            }
+        }
+
+        /// The gradient *plumbing* — leaf introduction, aliasing, unreachable
+        /// leaves, and the seed at the root.  An error in any of those would
+        /// corrupt every gradient this target ever reports rather than produce
+        /// one real finding, so unlike per-op derivative agreement it is
+        /// asserted.
+        ///
+        /// Most of that plumbing now lives in the shared driver, so these also
+        /// serve as the driver's own regression tests — via a target whose
+        /// `alias` and `grad` are implemented completely differently from
+        /// burn's.
+        fn assert_backward_plumbing_agrees(ops: Vec<DiffOp>, what: &str) {
+            let config = config();
+            let prog = AutogradProgram {
+                rows: 3,
+                cols: 3,
+                leaf_seeds: vec![
+                    WELL_BEHAVED.to_vec(),
+                    WELL_BEHAVED.iter().rev().copied().collect(),
+                ],
+                ops,
+            };
+            if let Err(msg) = run_autograd_program(&prog, &config) {
+                panic!(
+                    "gradient plumbing mismatch for {what}:\n{}\n{msg}",
+                    prog.ssa(config.max_leaves)
+                );
+            }
+        }
+
+        /// burn and candle both seed the root gradient with ones of the root's
+        /// shape, so unlike `tch_raw` there is no reduction to get wrong here —
+        /// which is exactly why it is worth an assertion: "nothing to do" is a
+        /// claim, and a root whose shape differs from the leaf's is where a
+        /// wrong one would show.
+        ///
+        /// `Repeat` is safe to include despite bug #5 — burn's `repeat_dim`
+        /// backward regroups the incoming gradient as though the forward had
+        /// interleaved, but the incoming gradient *is* the ones-seed here, and
+        /// every regrouping of ones sums to the same thing.  The bug needs a
+        /// non-uniform gradient to become visible, which is the fuzzer's job,
+        /// not this test's.
+        #[test]
+        fn backward_seed_matches_for_shape_changing_roots() {
+            for root in [
+                TensorInstr::SumAll(Reg(1)),
+                TensorInstr::MeanAll(Reg(1)),
+                TensorInstr::SumDim(Reg(1), 0),
+                TensorInstr::MeanDim(Reg(1), 1),
+                TensorInstr::Transpose(Reg(1)),
+                TensorInstr::Concat(Reg(1), Reg(1), 0),
+                TensorInstr::Repeat(Reg(1), 1, 3),
+                TensorInstr::Matmul(Reg(1), Reg(1)),
+            ] {
+                let line = root.ssa_line("r2", 2);
+                assert_backward_plumbing_agrees(
+                    vec![
+                        DiffOp::Instr(TensorInstr::Tanh(Reg(0))),
+                        DiffOp::Instr(root),
+                    ],
+                    &format!("r1 = tanh(r0); {line}"),
+                );
+            }
+        }
+
+        /// Multiple leaves, a leaf that never reaches the root, and an aliasing
+        /// leaf past the cap — the three places gradient plumbing could differ.
+        ///
+        /// The aliasing case is the one that matters most: candle identifies a
+        /// gradient by `TensorId`, so an `alias` that *copied* rather than
+        /// shared the `Arc` would silently lose the original leaf's
+        /// contribution.
+        #[test]
+        fn backward_plumbing_matches_across_leaves() {
+            let leaf = |seed: u8, rows: u8, cols: u8| DiffOp::Leaf { seed, rows, cols };
             assert_backward_plumbing_agrees(
                 vec![
-                    DiffOp::Instr(TensorInstr::Tanh(Reg(0))),
-                    DiffOp::Instr(root),
+                    leaf(1, 3, 3),
+                    DiffOp::Instr(TensorInstr::Mul(Reg(0), Reg(1))),
+                    leaf(0, 3, 3),
+                    DiffOp::Instr(TensorInstr::Matmul(Reg(2), Reg(3))),
+                    DiffOp::Instr(TensorInstr::SumAll(Reg(4))),
                 ],
-                &format!("r1 = tanh(r0); {line}"),
+                "two extra leaves, both reachable",
+            );
+            assert_backward_plumbing_agrees(
+                vec![
+                    // Introduced but never used: zeros on both sides — burn's
+                    // `None`, candle's absent GradStore entry.
+                    leaf(1, 2, 5),
+                    DiffOp::Instr(TensorInstr::Tanh(Reg(0))),
+                ],
+                "unreachable leaf",
+            );
+            assert_backward_plumbing_agrees(
+                vec![
+                    leaf(0, 3, 3),
+                    leaf(1, 3, 3),
+                    leaf(0, 3, 3),
+                    // Four leaves exist now (r0 + 3), so this one aliases.
+                    leaf(2, 3, 3),
+                    DiffOp::Instr(TensorInstr::Add(Reg(4), Reg(1))),
+                    DiffOp::Instr(TensorInstr::Mul(Reg(5), Reg(2))),
+                ],
+                "leaf cap reached, aliasing",
             );
         }
-    }
-
-    /// Multiple leaves, a leaf that never reaches the root, and an aliasing leaf
-    /// past the cap — the three places gradient plumbing could differ.
-    ///
-    /// The aliasing case is the one that matters most here: candle identifies a
-    /// gradient by `TensorId`, so an alias that *copied* rather than shared the
-    /// `Arc` would silently lose the original leaf's contribution.
-    #[test]
-    #[cfg(feature = "oracle-tch")]
-    fn backward_plumbing_matches_across_leaves() {
-        let leaf = |seed: u8, rows: u8, cols: u8| DiffOp::Leaf { seed, rows, cols };
-        assert_backward_plumbing_agrees(
-            vec![
-                leaf(1, 3, 3),
-                DiffOp::Instr(TensorInstr::Mul(Reg(0), Reg(1))),
-                leaf(0, 3, 3),
-                DiffOp::Instr(TensorInstr::Matmul(Reg(2), Reg(3))),
-                DiffOp::Instr(TensorInstr::SumAll(Reg(4))),
-            ],
-            "two extra leaves, both reachable",
-        );
-        assert_backward_plumbing_agrees(
-            vec![
-                // Introduced but never used: zeros on both sides — burn's
-                // `None`, candle's absent GradStore entry.
-                leaf(1, 2, 5),
-                DiffOp::Instr(TensorInstr::Tanh(Reg(0))),
-            ],
-            "unreachable leaf",
-        );
-        assert_backward_plumbing_agrees(
-            vec![
-                leaf(0, 3, 3),
-                leaf(1, 3, 3),
-                leaf(0, 3, 3),
-                // Four leaves exist now (r0 + 3), so this one aliases instead.
-                leaf(2, 3, 3),
-                DiffOp::Instr(TensorInstr::Add(Reg(4), Reg(1))),
-                DiffOp::Instr(TensorInstr::Mul(Reg(5), Reg(2))),
-            ],
-            "leaf cap reached, aliasing",
-        );
     }
 }

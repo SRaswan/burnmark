@@ -5,6 +5,8 @@
 //! saves the crash artifact), in `Continuous` it logs to stderr and moves on.
 
 pub(crate) mod shape;
+/// The one SSA driver, shared by every target — and the crate's only trait.
+mod driver;
 mod tensor_program;
 mod autograd;
 /// Raw tch-rs — the one interpreter in this crate that names no burn type.
@@ -18,8 +20,9 @@ mod candle;
 pub use tensor_program::run_tensor_program;
 pub use autograd::run_autograd_program;
 
-use burn::tensor::{activation, Device, Tensor};
+use burn::tensor::{activation, Device, Gradients, Tensor};
 
+use driver::Framework;
 use super::ops::{TensorInstr, POWF_EXPONENTS};
 use super::program::Backend;
 use shape::{Shape2, resolve_broadcast_compatible, resolve_matmul_compatible, resolve_concat_compatible};
@@ -244,6 +247,77 @@ fn eval_tensor_instr(
             regs[r.resolve(n)].clone().repeat_dim(dim, count)
         }
         TensorInstr::Clamp(r)     => regs[r.resolve(n)].clone().clamp(-1e6_f32, 1e6_f32),
+    }
+}
+
+// ─── burn as a `Framework` ────────────────────────────────────────────────────
+
+/// burn, on one device.
+///
+/// One struct covers every burn backend, because 0.22 made the backend a
+/// property of the `Device` rather than of the tensor's type — so unlike a
+/// non-burn target, adding a burn backend still costs zero interpreter code.
+///
+/// The *device* is what differs between the two program paths: the plain
+/// `TensorProgram` path wants a bare device and the autograd path wants
+/// `.autodiff()`, so the two constructors below are the whole difference.
+pub(super) struct BurnTarget {
+    device: Device,
+}
+
+impl BurnTarget {
+    /// For the forward-only path.
+    pub(super) fn forward(backend: Backend) -> Self {
+        BurnTarget { device: device_for(backend) }
+    }
+
+    /// For the autograd path.  `.autodiff()` is a `Device` method, so gradient
+    /// tracking comes along for every backend without the interpreter knowing
+    /// which one it is running on.
+    pub(super) fn autodiff(backend: Backend) -> Self {
+        BurnTarget { device: device_for(backend).autodiff() }
+    }
+}
+
+impl Framework for BurnTarget {
+    type Tensor = Tensor<2>;
+    type Grads = Gradients;
+
+    fn input(&self, raw: &[u8], rows: usize, cols: usize) -> Tensor<2> {
+        Tensor::<1>::from_floats(bytes_to_floats(raw, rows * cols).as_slice(), &self.device)
+            .reshape([rows, cols])
+    }
+
+    fn leaf(&self, raw: &[u8], rows: usize, cols: usize) -> Tensor<2> {
+        self.input(raw, rows, cols).require_grad()
+    }
+
+    fn alias(&self, tensor: &Tensor<2>) -> Tensor<2> {
+        // burn's `clone` shares the autodiff node, which is what `alias` needs.
+        tensor.clone()
+    }
+
+    fn eval(&self, regs: &[Tensor<2>], shapes: &[Shape2], instr: &TensorInstr) -> Tensor<2> {
+        eval_tensor_instr(regs, shapes, instr)
+    }
+
+    fn backward(&self, root: &Tensor<2>) -> Gradients {
+        // Seeds the root gradient with ones of the root's shape
+        // (`Gradients::new_with_hook` → `float_ones`) — the seed every other
+        // target has to match.
+        root.clone().backward()
+    }
+
+    fn grad(&self, grads: &Gradients, leaf: &Tensor<2>) -> Option<Tensor<2>> {
+        leaf.grad(grads)
+    }
+
+    fn to_vec(&self, tensor: &Tensor<2>) -> Vec<f32> {
+        tensor
+            .clone()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap_or_else(|e| panic!("burn into_data failed: {e}"))
     }
 }
 
