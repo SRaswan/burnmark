@@ -5,7 +5,7 @@ use burn::tensor::{Device, Tensor};
 use super::shape::Shape2;
 use super::shape::after_tensor_instr;
 use super::{assert_agreement, bytes_to_floats, catch_as_result, device_for, eval_tensor_instr};
-use crate::ir::program::{FuzzConfig, TensorProgram};
+use crate::ir::program::{FuzzConfig, Target, TensorProgram};
 
 /// Run a plain SSA TensorProgram on whichever backend `device` selects.
 fn eval_tensor_program(prog: &TensorProgram, device: &Device) -> Vec<f32> {
@@ -43,18 +43,36 @@ fn eval_tensor_program(prog: &TensorProgram, device: &Device) -> Vec<f32> {
         .expect("into_data failed")
 }
 
-/// Run a plain SSA TensorProgram on every backend in `config.backends` and
+/// Run `prog` on one target, dispatching to that target's interpreter.
+///
+/// The burn arm covers every burn *device* at once — 0.22 made the backend a
+/// property of the device, so one interpreter serves them all.  A non-burn
+/// target gets its own arm, because it has its own tensor type and therefore
+/// its own interpreter over the same IR.
+fn eval_on_target(prog: &TensorProgram, target: Target) -> Vec<f32> {
+    match target {
+        Target::Burn(backend) => eval_tensor_program(prog, &device_for(backend)),
+        #[cfg(feature = "oracle-tch-raw")]
+        Target::TchRaw => super::tch_raw::eval_tensor_program(prog),
+        #[cfg(feature = "oracle-candle")]
+        Target::Candle => super::candle::eval_tensor_program(prog),
+        #[allow(unreachable_patterns)]
+        unavailable => panic!(
+            "target {} is not compiled into this build",
+            unavailable.name()
+        ),
+    }
+}
+
+/// Run a plain SSA TensorProgram on every target in `config.targets` and
 /// require them to agree.  The first entry is the reference side; a single entry
 /// simply executes the program with no comparison.
 pub fn run_tensor_program(prog: &TensorProgram, config: &FuzzConfig) -> Result<(), String> {
     catch_as_result(std::panic::AssertUnwindSafe(|| {
         let outputs: Vec<(&'static str, Vec<f32>)> = config
-            .backends
+            .targets
             .iter()
-            .map(|&backend| {
-                let device = device_for(backend);
-                (backend.name(), eval_tensor_program(prog, &device))
-            })
+            .map(|&target| (target.name(), eval_on_target(prog, target)))
             .collect();
 
         let view: Vec<(&'static str, &[f32])> = outputs

@@ -102,58 +102,207 @@ impl Backend {
     }
 }
 
-/// Backends to run, **reference side first** — every other backend is compared
-/// against the first, and divergences are reported as `<backend> vs <reference>`.
+// ─── target selection ─────────────────────────────────────────────────────────
+
+/// A framework the interpreter executes a program against.
+///
+/// [`Backend`] is an axis *inside* burn: 0.22 made the backend a property of
+/// the device, so every burn backend shares one interpreter and one `Tensor<2>`
+/// type.  `Target` is the axis above that — which framework runs the program at
+/// all.  A non-burn target brings its own interpreter over the same
+/// [`TensorInstr`](super::ops::TensorInstr) vocabulary, so the IR, the
+/// generator, shape propagation, `values_diverge` and this selection logic are
+/// all shared while only execution differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    /// burn, on one of its devices.
+    Burn(Backend),
+    /// Raw tch-rs: libtorch called directly, with no burn code in the path.
+    ///
+    /// On the **forward** pass this reaches the same libtorch kernels
+    /// [`Backend::LibTorch`] does, so as a math oracle it adds little — but the
+    /// difference between the two is then exactly burn's FFI/translation layer,
+    /// and running both puts that bridge under test on its own.  That is the
+    /// class the original 0.20.1 `swap_dims` bug belonged to — a shallow clone
+    /// across the FFI boundary corrupting gradients, not a math error — and no
+    /// pairing of burn-internal backends can isolate it.
+    ///
+    /// On the **backward** pass it is not the same implementation at all:
+    /// `Device::libtorch().autodiff()` differentiates with burn-autodiff, so
+    /// every burn backend shares one set of derivative formulas and no
+    /// burn-vs-burn pairing can disagree about a derivative.  This target
+    /// brings libtorch's own autograd, making it the only pairing here whose
+    /// backward pass is implemented twice, independently — which matters, since
+    /// `fuzz_autograd` is where every bug so far has come from.
+    ///
+    /// It is also the one oracle burn cannot deprecate out from under this
+    /// fuzzer: `tch` is an independent project, and what burn `main` is
+    /// dropping is the bridge, not the library.
+    TchRaw,
+    /// candle: an independent Rust ML framework, with no burn and no libtorch
+    /// anywhere in the path.
+    ///
+    /// Every other entry here shares an implementation with some other entry.
+    /// The four burn backends share burn-autodiff's derivative formulas;
+    /// [`Backend::LibTorch`] and [`Target::TchRaw`] share libtorch's forward
+    /// kernels.  candle shares neither: its kernels are its own and its
+    /// autograd is its own, so it is the first target in this fuzzer that can
+    /// disagree with *everything* else at once — and the first whose agreement
+    /// with a burn backend is evidence rather than tautology.
+    ///
+    /// What that costs, and it is a real cost: a candle-vs-burn divergence no
+    /// longer localises the bug.  `libtorch` vs `tch-raw` differ by exactly one
+    /// thing (burn's bridge), so a divergence there names its own culprit;
+    /// candle vs burn differ by two whole implementations, so triage has to
+    /// decide which side is wrong.  Running candle *alongside* libtorch —
+    /// `BACKENDS=tch-raw,candle,flex` — is what makes that decision cheap: two
+    /// independent oracles agreeing against burn is a finding, and the one case
+    /// where they split is candle's own bug.
+    Candle,
+}
+
+impl Target {
+    /// Every target this fuzzer knows about, most-trustworthy first.
+    ///
+    /// The one place this ordering is written down; [`Target::available`]
+    /// filters it without reordering, so the reference side is whichever of
+    /// these is compiled in first.
+    ///
+    /// Raw tch-rs leads: it is libtorch — whose documented special-value
+    /// conventions are what the other backends are judged against — minus
+    /// burn's bridge, so alone among these entries it cannot be wrong
+    /// *because of* a burn bug.  candle follows for the same structural reason
+    /// (no burn in the path, so no burn bug can reach it) but behind libtorch,
+    /// because what a divergence is judged *against* is PyTorch's documented
+    /// conventions and libtorch is where those are defined — candle is a
+    /// younger implementation that has yet to earn that role.  burn's own
+    /// LibTorch backend is libtorch's math plus the bridge, so it stays below
+    /// CubeCL CPU, which is at least not deprecated.
+    pub const ALL: [Target; 6] = [
+        Target::TchRaw,
+        Target::Candle,
+        Target::Burn(Backend::Cpu),
+        Target::Burn(Backend::LibTorch),
+        Target::Burn(Backend::NdArray),
+        Target::Burn(Backend::Flex),
+    ];
+
+    /// Name used in `BACKENDS` and in divergence reports.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Target::Burn(backend) => backend.name(),
+            Target::TchRaw => "tch-raw",
+            Target::Candle => "candle",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            // Deliberately disjoint from "libtorch"/"tch"/"torch", which stay
+            // burn's tch *backend*.  The two differ by burn's bridge and the
+            // entire point is to run them against each other, so a name that
+            // could mean either would defeat the comparison.
+            "tch-raw" | "raw-tch" | "tch_raw" | "rawtch" => Some(Target::TchRaw),
+            // No burn backend wraps candle in this build, so unlike `tch-raw`
+            // there is no name to stay disjoint from — but burn *does* ship a
+            // candle backend, so if one is ever wired in it must take a
+            // distinct name rather than an alias of this one.
+            "candle" | "candle-core" => Some(Target::Candle),
+            other => Backend::from_name(other).map(Target::Burn),
+        }
+    }
+
+    /// Whether this build was compiled with support for this target.
+    pub const fn is_compiled_in(self) -> bool {
+        match self {
+            Target::Burn(backend) => backend.is_compiled_in(),
+            Target::TchRaw => cfg!(feature = "oracle-tch-raw"),
+            Target::Candle => cfg!(feature = "oracle-candle"),
+        }
+    }
+
+    /// The cargo feature that would add this target to a build.
+    ///
+    /// NdArray has no feature of its own — it is burn's default and always
+    /// compiled in — so that arm is unreachable from the only caller, which
+    /// asks this question only about targets that are *missing*.
+    const fn feature(self) -> &'static str {
+        match self {
+            Target::Burn(Backend::NdArray) => "ndarray (always compiled in)",
+            Target::Burn(Backend::Flex) => "oracle-flex",
+            Target::Burn(Backend::LibTorch) => "oracle-tch",
+            Target::Burn(Backend::Cpu) => "oracle-cpu",
+            Target::TchRaw => "oracle-tch-raw",
+            Target::Candle => "oracle-candle",
+        }
+    }
+
+    /// Every target this build can run, most-trustworthy first.
+    ///
+    /// This ordering *is* the default reference choice whenever `BACKENDS` is
+    /// unset, so it leads with the targets both believed correct and not
+    /// deprecated: raw tch-rs, then candle, then CubeCL CPU, then burn's
+    /// LibTorch backend — correct, but deprecated on burn `main` — then the two
+    /// CPU backends known to be wrong on `sign(NaN)`.
+    pub fn available() -> Vec<Self> {
+        Target::ALL
+            .into_iter()
+            .filter(|t| t.is_compiled_in())
+            .collect()
+    }
+}
+
+/// Targets to run, **reference side first** — every other target is compared
+/// against the first, and divergences are reported as `<target> vs <reference>`.
 ///
 /// Parsed from `BACKENDS`: a comma-separated list of names, or `all`.  Unset
-/// runs every backend compiled in, in [`Backend::available`]'s order — so the
-/// reference is CubeCL CPU when `oracle-cpu` is compiled in, LibTorch when it is
-/// not, and NdArray alone in a default build.  A single entry runs the program
-/// without any comparison, which is useful for smoke and throughput runs.
+/// runs every target compiled in, in [`Target::available`]'s order.  A single
+/// entry runs the program without any comparison, which is useful for smoke and
+/// throughput runs.
+///
+/// The variable keeps its original name so existing command lines and crash
+/// reproductions keep working; what it selects is now a target rather than a
+/// burn backend, which is a strict superset.  `libtorch` still means burn's tch
+/// backend; `tch-raw` is the new non-burn one.
 ///
 /// An unparseable or unavailable selection panics rather than silently dropping
-/// a requested side: quietly comparing fewer backends than asked for would
+/// a requested side: quietly comparing fewer targets than asked for would
 /// manufacture exactly the false confidence this fuzzer exists to prevent.
-pub fn backends_from_env() -> Vec<Backend> {
+pub fn targets_from_env() -> Vec<Target> {
     let requested = match std::env::var("BACKENDS") {
-        Err(_) => return Backend::available(),
-        Ok(raw) if raw.trim().is_empty() => return Backend::available(),
-        Ok(raw) if raw.trim().eq_ignore_ascii_case("all") => return Backend::available(),
+        Err(_) => return Target::available(),
+        Ok(raw) if raw.trim().is_empty() => return Target::available(),
+        Ok(raw) if raw.trim().eq_ignore_ascii_case("all") => return Target::available(),
         Ok(raw) => raw,
     };
 
-    let mut selected: Vec<Backend> = Vec::new();
+    let mut selected: Vec<Target> = Vec::new();
     for token in requested.split(',') {
         let name = token.trim().to_lowercase();
         if name.is_empty() {
             continue;
         }
-        let backend = Backend::from_name(&name).unwrap_or_else(|| {
+        let target = Target::from_name(&name).unwrap_or_else(|| {
             panic!(
                 "invalid BACKENDS entry {name:?}: expected one of \
-                 ndarray, flex, libtorch, cpu (or `all`)"
+                 ndarray, flex, libtorch, cpu, tch-raw, candle (or `all`)"
             )
         });
-        if !backend.is_compiled_in() {
-            let feature = match backend {
-                Backend::Flex => "oracle-flex",
-                Backend::LibTorch => "oracle-tch",
-                Backend::Cpu => "oracle-cpu",
-                Backend::NdArray => unreachable!("NdArray is always compiled in"),
-            };
+        if !target.is_compiled_in() {
             panic!(
                 "BACKENDS requested {name:?}, which this build does not support \
-                 — rebuild with --features {feature}. Available: {:?}",
-                Backend::available().iter().map(|b| b.name()).collect::<Vec<_>>()
+                 — rebuild with --features {}. Available: {:?}",
+                target.feature(),
+                Target::available().iter().map(|t| t.name()).collect::<Vec<_>>()
             );
         }
-        if !selected.contains(&backend) {
-            selected.push(backend);
+        if !selected.contains(&target) {
+            selected.push(target);
         }
     }
 
     if selected.is_empty() {
-        panic!("BACKENDS named no usable backend");
+        panic!("BACKENDS named no usable target");
     }
     selected
 }
@@ -170,8 +319,8 @@ pub struct FuzzConfig {
     pub min_dim: usize,
     pub max_dim: usize,
 
-    /// Backends to run and cross-check, reference side first.
-    pub backends: Vec<Backend>,
+    /// Targets to run and cross-check, reference side first.
+    pub targets: Vec<Target>,
 }
 
 impl Default for FuzzConfig {
@@ -182,7 +331,7 @@ impl Default for FuzzConfig {
             mode: HarnessMode::PanicOnFirstError,
             min_dim: 1,
             max_dim: 16,
-            backends: Backend::available(),
+            targets: Target::available(),
         }
     }
 }
@@ -227,7 +376,7 @@ impl FuzzConfig {
             mode,
             min_dim,
             max_dim,
-            backends: backends_from_env(),
+            targets: targets_from_env(),
         }
     }
 }
@@ -415,5 +564,117 @@ mod backend_selection_tests {
         assert_eq!(Backend::from_name("tch"), Some(Backend::LibTorch));
         assert_eq!(Backend::from_name("cubecl-cpu"), Some(Backend::Cpu));
         assert_eq!(Backend::from_name("nonsense"), None);
+    }
+}
+
+#[cfg(test)]
+mod target_selection_tests {
+    use super::{Backend, Target};
+
+    #[test]
+    fn target_names_round_trip() {
+        for target in Target::ALL {
+            assert_eq!(
+                Target::from_name(target.name()),
+                Some(target),
+                "{} must parse back to itself",
+                target.name()
+            );
+        }
+        assert_eq!(Target::from_name("nonsense"), None);
+    }
+
+    /// The two libtorch routes must never share a name.  They reach the same
+    /// C++ library and differ only by burn's bridge, so the whole point is to
+    /// run them *against each other* — a name that could resolve to either
+    /// would silently turn that comparison into a target compared with itself.
+    #[test]
+    fn raw_tch_and_burns_libtorch_backend_are_distinct() {
+        for burn_name in ["libtorch", "tch", "torch"] {
+            assert_eq!(
+                Target::from_name(burn_name),
+                Some(Target::Burn(Backend::LibTorch)),
+                "{burn_name:?} must stay burn's tch backend"
+            );
+        }
+        for raw_name in ["tch-raw", "raw-tch", "tch_raw", "rawtch"] {
+            assert_eq!(
+                Target::from_name(raw_name),
+                Some(Target::TchRaw),
+                "{raw_name:?} must be the non-burn target"
+            );
+        }
+        assert_ne!(Target::TchRaw.name(), Target::Burn(Backend::LibTorch).name());
+    }
+
+    /// Raw tch-rs is libtorch minus burn's bridge, so it cannot be wrong
+    /// *because of* a burn bug — which no other entry can claim.  It therefore
+    /// takes the reference slot ahead of CubeCL CPU, which in turn stays ahead
+    /// of burn's own (deprecated) LibTorch backend.
+    #[test]
+    fn raw_tch_leads_the_trust_order() {
+        let order = |t| Target::ALL.iter().position(|x| *x == t);
+        assert!(order(Target::TchRaw) < order(Target::Candle));
+        assert!(order(Target::Candle) < order(Target::Burn(Backend::Cpu)));
+        assert!(order(Target::Burn(Backend::Cpu)) < order(Target::Burn(Backend::LibTorch)));
+        assert!(order(Target::Burn(Backend::LibTorch)) < order(Target::Burn(Backend::NdArray)));
+    }
+
+    /// Both non-burn targets must outrank every burn one.  A burn backend in
+    /// the reference slot means the oracle can be wrong *because of* the bug it
+    /// is looking for, which is the failure mode `Target` exists to avoid;
+    /// neither `tch-raw` nor `candle` has burn anywhere in its path.
+    #[test]
+    fn non_burn_targets_outrank_every_burn_target() {
+        let last_non_burn = Target::ALL
+            .iter()
+            .rposition(|t| !matches!(t, Target::Burn(_)))
+            .expect("at least one non-burn target");
+        let first_burn = Target::ALL
+            .iter()
+            .position(|t| matches!(t, Target::Burn(_)))
+            .expect("at least one burn target");
+        assert!(last_non_burn < first_burn, "{:?}", Target::ALL);
+    }
+
+    /// `Target::ALL` must cover `Backend::ALL`: a burn backend with no target
+    /// slot would be selectable by name and then never actually run.
+    #[test]
+    fn every_burn_backend_has_a_target_slot() {
+        for backend in Backend::ALL {
+            assert!(
+                Target::ALL.contains(&Target::Burn(backend)),
+                "{} has no Target slot",
+                backend.name()
+            );
+        }
+        assert_eq!(
+            Target::ALL.len(),
+            Backend::ALL.len() + 2,
+            "burn backends + the two non-burn targets (tch-raw, candle)"
+        );
+    }
+
+    /// Burn's ordering must survive being lifted into `Target::ALL` — the two
+    /// lists disagreeing would make the default reference depend on which one
+    /// a reader happened to consult.
+    #[test]
+    fn burn_ordering_is_preserved_inside_target_ordering() {
+        let lifted: Vec<Backend> = Target::ALL
+            .iter()
+            .filter_map(|t| match t {
+                Target::Burn(b) => Some(*b),
+                Target::TchRaw | Target::Candle => None,
+            })
+            .collect();
+        assert_eq!(lifted, Backend::ALL.to_vec());
+    }
+
+    #[test]
+    fn available_targets_are_compiled_in() {
+        let available = Target::available();
+        assert!(available.iter().all(|t| t.is_compiled_in()));
+        // NdArray is unconditional, so the list is never empty.
+        assert!(available.contains(&Target::Burn(Backend::NdArray)));
     }
 }

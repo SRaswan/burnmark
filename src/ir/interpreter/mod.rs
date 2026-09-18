@@ -7,6 +7,13 @@
 pub(crate) mod shape;
 mod tensor_program;
 mod autograd;
+/// Raw tch-rs — the one interpreter in this crate that names no burn type.
+#[cfg(feature = "oracle-tch-raw")]
+mod tch_raw;
+/// candle — the second interpreter here that names no burn type, and the first
+/// that also reaches none of burn's dependencies.
+#[cfg(feature = "oracle-candle")]
+mod candle;
 
 pub use tensor_program::run_tensor_program;
 pub use autograd::run_autograd_program;
@@ -90,7 +97,7 @@ fn device_for(backend: Backend) -> Device {
 /// **agreement** for every pair involving a `NaN` or an infinity, in either
 /// direction, which is what this harness used to do.
 ///
-/// That mattered: three of the four backend bugs found so far are special-value
+/// That mattered: three of the five backend bugs found so far are special-value
 /// bugs, so the old comparison was blind to its own subject matter. The
 /// burn-flex `sign(NaN)` divergence (`NaN` where LibTorch returns `-0.0`) is
 /// precisely the shape it ran straight past.

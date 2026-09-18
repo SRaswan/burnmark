@@ -2,47 +2,44 @@
 
 Active and past bugs found by this fuzzer, their root causes, fix locations,
 and filing status. This is the working log — read it before touching any of
-the four bugs below or resuming bug #4's investigation. See `CLAUDE.local.md`
+the five bugs below or resuming bug #4's investigation. See `CLAUDE.local.md`
 for the project's goal and how to extend the fuzzer itself.
 
 ## Current state
 
-Fuzzer targets Burn `0.22.0-pre.3` (newest published; no stable 0.22.0 on
-crates.io, `main` is also `0.22.0-pre.3`) and runs clean. The original 0.20.1
+Fuzzer targets Burn `0.22.0-pre.3` and runs clean. The original 0.20.1
 `swap_dims` bug is confirmed fixed on 0.22.
 
-Four distinct bugs found since. **All four fixes are written and tested; none is
-filed anywhere.** Filing is the bottleneck, and the whole point of this project.
+**Two fixes are merged upstream.** Filing was the bottleneck; it no longer is
+for those two.
 
-| # | Bug | Owner repo | Fix location | Filed |
-|---|---|---|---|---|
-| 1 | aarch64 SIMD `recip()` silently loses ~0.2% precision on ≥32 elements (`vrecpeq_f32` with no Newton–Raphson refinement); corrupts `log()`'s gradient and `sigmoid()`'s forward pass | **macerator** (a burn *dependency*) | `~/Documents/Workspace/macerator`, branch `newton`, commits `3de8779` + `f94b31d` | no |
-| 2 | `sign(NaN)` returns ±1 from the raw sign *bit*, so `abs(log(x))`'s gradient is `1/x` garbage for `x < 0` | **burn-ndarray** | `~/Documents/Workspace/burn`, branch `fix-sign-nan`, commit `189903ad0` | no |
-| 2b | same bug class, independent implementation (`copysign`-based `float_sign` returning the NaN itself) | **burn-flex** | same branch, commit `c11a8a037` — fixed by peer session `burn-f3`, not mine to redo | no |
-| 3 | `powf_scalar(0.0)` returns a tensor detached from the autodiff graph (`float_powi_scalar`'s `0 => float_ones(...)` arm is a *constructor*, unrelated to `lhs`); every backend inherits it | **burn-backend** (not deprecated — the strongest of the four) | worktree `~/Documents/Workspace/burn-powi-fix`, branch `fix-powi-scalar-zero-grad` (stacked on `fix-sign-nan`), commit `e090bdd0d` | no |
-| 4 | `x.log().relu().relu()` with `x < 0`: gradient wrong in exactly the trailing `n mod 4` elements | burn-ndarray (suspected) | **not root-caused — no fix** | no |
+| # | Bug | Owner repo | Status |
+|---|---|---|---|
+| 1 | aarch64 SIMD `recip()` silently loses ~0.2% precision on ≥32 elements (`vrecpeq_f32` with no Newton–Raphson refinement); corrupts `log()`'s gradient and `sigmoid()`'s forward pass | **macerator** (a burn *dependency*) | **pending** — branch `newton` in `~/Documents/Workspace/macerator`, 9 commits ahead of `upstream/main` |
+| 2 | `sign(NaN)` returned ±1 from the raw sign *bit*, so `abs(log(x))`'s gradient was `1/x` garbage for `x < 0` | **burn-ndarray** *and* **burn-flex** | **MERGED** — [burn#5665](https://github.com/tracel-ai/burn/pull/5665), `66a8a5ff8`, 2026-09-15. One PR fixed both backends: ndarray's sign-bit read and flex's `copysign`-based `float_sign` (the flex half was first spotted independently by peer session `burn-f3`, commit `c11a8a037` in the shared checkout) |
+| 3 | `powf_scalar(0.0)` returned a tensor detached from the autodiff graph (`float_powi_scalar`'s `0 => float_ones(...)` arm is a *constructor*, unrelated to `lhs`); every backend inherited it | **burn-backend** / autodiff | **MERGED** — [burn#5692](https://github.com/tracel-ai/burn/pull/5692), `98e48ddbd`, 2026-09-17, as "preserve gradients for zero scalar exponents" |
+| 4 | `x.log().relu().relu()` with `x < 0`: gradient wrong in exactly the trailing `n mod 4` elements | burn-ndarray (suspected) | **open, not root-caused** — see below |
+| 5 | `repeat_dim` backward groups incoming gradients as if the forward had *interleaved*, but the forward *tiles*. Silently wrong gradient whenever the repeated dim has size > 1 | **burn autodiff** (every backend) | **open, new** — found 2026-09-17, see below |
 
-Per-bug detail, root-cause traces, and repros live in `docs/` —
+Per-bug root-cause traces and repros live in `docs/` —
 `simd-recip-precision-bug.md`, `powi-scalar-zero-grad-bug.md`,
 `relu-chain-nan-simd-remainder-bug.md` — with standalone reproductions in
-`examples/`. Don't re-derive any of it from scratch; read the writeup first.
+`examples/`. Read the writeup before re-deriving anything.
 
-### Filing order (burn-ndarray is deprecated)
+### What's left to file
 
-`Device::ndarray()` now carries `#[deprecated(since = "0.22.0", ...)]`: burn-ndarray
-is slated for removal in favour of burn-flex. Three of the four bugs are in a
-backend that is going away, which reorders what to file:
-
-1. **#3 `powf_scalar(0)`** — in `burn-backend`'s default impl, not deprecated,
-   inherited identically by every backend. File first.
-2. **#2b burn-flex `sign(NaN)`** — in the backend that *replaces* NdArray, so it
-   stays relevant. Confirmed present in the published crate, not just `main`.
-3. **#2 burn-ndarray `sign(NaN)`** — correct, but a fix to code on its way out.
-   Best filed as the second half of #2b (one bug class, two backends) rather
-   than alone.
-
-#1 is a `macerator` PR, and should ship with a linked burn-ndarray issue: the
-people who *hit* it are burn users who have no idea macerator exists.
+1. **#5 `repeat_dim` backward** — in burn's autodiff, so every backend inherits
+   it, and nothing about it is deprecated. Same category strength as #3, which
+   went in cleanly. Needs a repro in `examples/` and a root-cause line.
+2. **#4 relu-chain NaN tail** — worth filing as an issue with the repro as-is
+   even unrooted; the signature is precise enough that someone with
+   checkpointing context could spot it fast. Note that others are actively
+   fixing NaN bugs in this area right now ([#5658](https://github.com/tracel-ai/burn/pull/5658)
+   flex relu/clamp NaN propagation, [#5662](https://github.com/tracel-ai/burn/pull/5662)
+   flex max pooling, both by other contributors, both merged) — so this one is
+   at real risk of being landed by someone else first.
+3. **#1 macerator** — pending. It should ship with a linked burn-ndarray issue:
+   the people who *hit* it are burn users who have no idea macerator exists.
 
 ### Still open: bug #4, resume here
 
@@ -66,10 +63,55 @@ needs two. Leading unconfirmed hypothesis: `relu`'s `.memory_bound()` /
 `RetroForward` checkpointing means a second stacked `relu` forces the first's
 output to be *recomputed*, and that recomputation's SIMD `clamp_min` may handle
 the NaN tail differently. **This is where the investigation stopped** — deep in
-burn's checkpointing internals. No fix attempted, because nothing is pinned to a
-line yet. Worth filing as an issue with the repro as-is regardless; the
-signature is precise enough that someone with checkpointing context could likely
-spot it fast.
+burn's checkpointing internals.
+
+**Cheapest next experiment:** a `simd`-off build. `burn-ndarray` and `burn-flex`
+are both `default = ["std", "simd", "multi-threads"]`, so dropping `simd` yields
+a scalar build of the identical backend. If the divergence vanishes, macerator's
+tail handling is confirmed; if it persists, macerator is cleared and the
+checkpointing hypothesis survives. Compile-time, so it is a two-build comparison
+or a one-shot on the #4 repro — do the one-shot first. *Not yet run.*
+
+### Newly found: bug #5, `repeat_dim` backward
+
+Found by the raw tch-rs target within a minute of it being wired in, and it is
+the kind of bug **no burn-vs-burn pairing could have found**: every burn backend
+shares burn-autodiff, so they all compute the same wrong gradient and agree with
+each other. libtorch's own autograd is the first independent second opinion this
+fuzzer has ever had on a derivative.
+
+Minimal repro — `x` is `[2×2]`, `y = sum(log(x.repeat_dim(0, 2)))`, so
+`dy/dx == 2/x` exactly:
+
+```
+x = [0.225, 0.35, 0.475, 0.6]
+
+forward   burn = [0.225, 0.35, 0.475, 0.6, 0.225, 0.35, 0.475, 0.6]   tile
+      libtorch = [0.225, 0.35, 0.475, 0.6, 0.225, 0.35, 0.475, 0.6]   identical
+
+dy/dx     burn = [6.549708, 4.5238094, 6.549708, 4.5238094]
+      libtorch = [8.888889, 5.714286, 4.2105265, 3.3333333]           == 2/x, correct
+```
+
+burn's numbers are bit-exactly `[1/x₀+1/x₂, 1/x₁+1/x₃, 1/x₀+1/x₂, 1/x₁+1/x₃]` —
+the grouping you get if the forward had been `repeat_interleave`. So the forward
+tiles and the backward un-tiles as though it had interleaved. Equivalently, the
+gradient is reshaped `[orig_dim, k, …]` and reduced over the wrong axis when it
+should be `[k, orig_dim, …]` reduced over axis 0.
+
+Reproduces identically on `ndarray` and `libtorch`, which places it in
+burn-autodiff rather than a backend. Correct only when the repeated dimension
+has size 1 (the two groupings coincide) — swept `[1×4] [2×2] [2×3] [3×2] [4×1]
+[2×5] [3×3]` × `dim ∈ {0,1}` × `k ∈ {2,3}`; every case with
+`size(dim) > 1` is wrong.
+
+**Why burn's own tests miss it:** with a bare `sum(repeat_dim(x, d, k))` every
+upstream gradient is `1`, so any mis-grouping of them sums to the same `k` and
+the result is correct. It takes a *non-uniform* upstream gradient — the `log`
+here — to expose the permutation. Any test that repeats and sums will pass.
+
+Not yet root-caused to a line in burn's source, and no `examples/` repro
+written yet.
 
 ### Operational gotchas that keep biting
 
@@ -107,12 +149,11 @@ spot it fast.
 
 ### Oracle fix worth knowing about
 
-The old `compare_outputs` decided divergence purely by
-`abs_diff > 1e-4 * scale`, which is `false` whenever either side is `NaN` or
+`values_diverge` (`src/ir/interpreter/mod.rs`) used to decide divergence purely
+by `abs_diff > 1e-4 * scale`, which is `false` whenever either side is `NaN` or
 infinite — so **every** special-value divergence was silently reported as
-agreement. Measured on the real libtorch-vs-flex gradient vectors: old oracle
-0 divergences, new oracle 3. Three of the four bugs here are special-value bugs,
-so this was the harness blind to its own subject matter, and it explains why the
-burn-flex `sign(NaN)` bug was found by reading code rather than by fuzzing.
-`values_diverge` in `src/ir/interpreter/mod.rs` now branches on `is_nan` /
-`is_infinite` first, with unit tests.
+agreement. Measured on the real libtorch-vs-flex gradient vectors: old oracle 0
+divergences, new oracle 3. Most bugs here are special-value bugs, so this was
+the harness blind to its own subject matter, and it explains why the burn-flex
+`sign(NaN)` bug was found by reading code rather than by fuzzing. The rationale
+now lives in that function's doc comment, with unit tests beside it.

@@ -6,7 +6,7 @@ use super::shape::Shape2;
 use super::shape::after_diff_op;
 use super::{assert_agreement, bytes_to_floats, catch_as_result, device_for, eval_tensor_instr};
 use crate::ir::ops::DiffOp;
-use crate::ir::program::{AutogradProgram, FuzzConfig};
+use crate::ir::program::{AutogradProgram, FuzzConfig, Target};
 
 fn make_leaf(raw: &[u8], rows: usize, cols: usize, device: &Device) -> Tensor<2> {
     Tensor::<1>::from_floats(
@@ -119,21 +119,44 @@ fn collect_grads(
         .collect()
 }
 
-/// Run `prog` on every backend in `config.backends` and require their per-leaf
+/// Collect per-leaf gradients from one target, dispatching to its interpreter.
+///
+/// On the burn side, `.autodiff()` wraps whichever backend the device selects,
+/// so every burn entry gets gradient tracking without the interpreter having to
+/// know which backend it is running on.  A non-burn target uses its own
+/// framework's autograd — which is the point: the backward pass is then
+/// implemented twice, independently, over the same program.
+fn grads_on_target(
+    prog: &AutogradProgram,
+    config: &FuzzConfig,
+    target: Target,
+) -> Vec<Vec<f32>> {
+    match target {
+        Target::Burn(backend) => {
+            let device = device_for(backend).autodiff();
+            collect_grads(prog, config, &device)
+        }
+        #[cfg(feature = "oracle-tch-raw")]
+        Target::TchRaw => super::tch_raw::collect_grads(prog, config),
+        #[cfg(feature = "oracle-candle")]
+        Target::Candle => super::candle::collect_grads(prog, config),
+        #[allow(unreachable_patterns)]
+        unavailable => panic!(
+            "target {} is not compiled into this build",
+            unavailable.name()
+        ),
+    }
+}
+
+/// Run `prog` on every target in `config.targets` and require their per-leaf
 /// gradients to agree.  The first entry is the reference side; a single entry
 /// simply executes the program with no comparison.
 pub fn run_autograd_program(prog: &AutogradProgram, config: &FuzzConfig) -> Result<(), String> {
     catch_as_result(std::panic::AssertUnwindSafe(|| {
-        // `.autodiff()` wraps whichever backend the device selects, so every
-        // entry gets gradient tracking without the interpreter having to know
-        // which backend it is running on.
         let grads: Vec<(&'static str, Vec<Vec<f32>>)> = config
-            .backends
+            .targets
             .iter()
-            .map(|&backend| {
-                let device = device_for(backend).autodiff();
-                (backend.name(), collect_grads(prog, config, &device))
-            })
+            .map(|&target| (target.name(), grads_on_target(prog, config, target)))
             .collect();
 
         let Some(((ref_name, reference), others)) = grads.split_first() else {

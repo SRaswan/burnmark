@@ -4,14 +4,14 @@
 
 This project evaluates the Rust ML ecosystem *correctness* via differential fuzzing:
 
-- **Tensor-level differential fuzzer** that generates shape-aware SSA programs and tests Burn's autograd engine across backends — NdArray, burn-flex, and LibTorch, in any combination — cross-checking both forward values and gradients. Found 17 distinct autograd crashes in Burn 0.20.1, and four further distinct bugs in 0.22 (see the [Roadmap](#roadmap) and `docs/`).
+- **Tensor-level differential fuzzer** that generates shape-aware SSA programs and tests Burn's autograd engine across backends — NdArray, burn-flex, LibTorch and CubeCL CPU, in any combination, plus two non-burn targets, raw tch-rs and candle — cross-checking both forward values and gradients. Found distinct autograd crashes in Burn 0.20.1 and five further distinct bugs in 0.22; two fixes are merged upstream ([#5665](https://github.com/tracel-ai/burn/pull/5665), [#5692](https://github.com/tracel-ai/burn/pull/5692)). Status for each lives in [`bugs.md`](bugs.md).
 
 ## Running the Fuzzer
 
 All commands run from `burnmark/`. Requires `cargo-fuzz` (`cargo install cargo-fuzz`) and a nightly toolchain.
 
 ```bash
-# Autograd fuzzing (backward-pass, found the 17 crashes)
+# Autograd fuzzing (backward-pass — where every bug so far has come from)
 cargo +nightly fuzz run fuzz_autograd
 
 # Multi-op tensor program fuzzing (forward-pass only)
@@ -25,39 +25,140 @@ cargo +nightly fuzz run fuzz_autograd fuzz/artifacts/fuzz_autograd/<artifact-fil
 
 Which backends a build *can* run is a compile-time feature; which it *does* run
 is the `BACKENDS` environment variable, a comma-separated list. **The first entry
-is the reference** — every other backend is compared against it, and divergences
-are reported as `<backend> vs <reference>`.
+is the reference** — every other entry is compared against it, and divergences
+are reported as `<name> vs <reference>`.
+
+Most entries name a burn *device*. Two name different frameworks entirely:
+`tch-raw` is libtorch called directly through tch-rs, and `candle` is candle
+with neither burn nor libtorch anywhere in the path. `libtorch` and `tch-raw`
+are deliberately distinct names for two different routes to the same C++
+library — see below for why running both is the point.
 
 ```bash
-# Build-time availability: ndarray is always in; these add the other three.
-#   --features oracle-tch  → libtorch    --features oracle-flex → flex
-#   --features oracle-cpu  → cpu (CubeCL CPU)
+# Build-time availability: ndarray is always in; these add the rest.
+#   --features oracle-tch      → libtorch (burn's tch backend)
+#   --features oracle-flex     → flex
+#   --features oracle-cpu      → cpu (CubeCL CPU)
+#   --features oracle-tch-raw  → tch-raw (raw tch-rs, no burn)
+#   --features oracle-candle   → candle (candle-core, no burn and no libtorch)
 
-# `cpu` MUST use --sanitizer=none (linkme/ASAN, see Roadmap) and a raised RSS
-# limit (CubeCL's JIT cache grows); without both it dies in under a minute.
+# `cpu` needs -Cllvm-args=-asan-globals=0 (keeps ASAN; works around a linkme
+# dupcheck false positive — see Roadmap) and a raised RSS limit, since CubeCL's
+# JIT cache grows. Without both it dies in under a minute. `--sanitizer=none`
+# also works but needlessly gives up the sanitizer.
+RUSTFLAGS="-Cllvm-args=-asan-globals=0" \
 BACKENDS=cpu,flex,ndarray  cargo +nightly fuzz run fuzz_autograd --features oracle-cpu,oracle-flex \
-                             --sanitizer=none -- -rss_limit_mb=8192
+                             -- -rss_limit_mb=8192
+RUSTFLAGS="-Cllvm-args=-asan-globals=0" \
 BACKENDS=cpu,libtorch      cargo +nightly fuzz run fuzz_autograd --features oracle-cpu,oracle-tch \
-                             --sanitizer=none -- -rss_limit_mb=8192
+                             -- -rss_limit_mb=8192
 
+BACKENDS=tch-raw,libtorch  cargo +nightly fuzz run fuzz_autograd --features oracle-tch-raw,oracle-tch
+BACKENDS=tch-raw,flex      cargo +nightly fuzz run fuzz_autograd --features oracle-tch-raw,oracle-flex
+BACKENDS=candle,flex       cargo +nightly fuzz run fuzz_autograd --features oracle-candle,oracle-flex
+# Two independent oracles against burn — see "triage by majority" below.
+BACKENDS=tch-raw,candle,flex \
+                           cargo +nightly fuzz run fuzz_autograd --features oracle-tch-raw,oracle-candle,oracle-flex
 BACKENDS=libtorch,ndarray  cargo +nightly fuzz run fuzz_autograd --features oracle-tch
 BACKENDS=libtorch,flex     cargo +nightly fuzz run fuzz_autograd --features oracle-tch,oracle-flex
 BACKENDS=flex,ndarray      cargo +nightly fuzz run fuzz_autograd --features oracle-flex
-BACKENDS=all               cargo +nightly fuzz run fuzz_autograd --features oracle-tch,oracle-flex,oracle-cpu
+BACKENDS=all               cargo +nightly fuzz run fuzz_autograd --features oracle-tch,oracle-flex,oracle-cpu,oracle-tch-raw,oracle-candle
 BACKENDS=ndarray           cargo +nightly fuzz run fuzz_autograd   # no comparison; smoke/throughput runs
 ```
 
 `BACKENDS=cpu,flex,ndarray` is the useful default once burn-tch is removed: it
 keeps a reference believed correct without depending on a deprecated backend.
-`BACKENDS=cpu,libtorch` is the interesting *new* signal — two independently
-implemented backends both believed correct, so any disagreement between them is
-a finding rather than a known-wrong backend restating a known bug.
+`BACKENDS=cpu,libtorch` is two independently implemented burn backends both
+believed correct, so any disagreement between them is a finding rather than a
+known-wrong backend restating a known bug.
 
-Unset `BACKENDS` runs every backend compiled in, reference side first — `cpu`
-when `oracle-cpu` is compiled in, else `libtorch`, else `ndarray` alone. A
-selection naming an unknown backend, or one this build lacks, fails loudly with
-the missing feature named rather than silently comparing fewer backends than
-asked for.
+`BACKENDS=tch-raw,libtorch` is the pairing that tests something none of the
+others can, and it is worth being precise about what:
+
+- **On the forward pass** both sides execute the *same* libtorch kernels, so
+  there is no legitimate numerical difference between them. What differs is
+  burn's FFI/translation layer, which means that layer is on its own under
+  test. That is the class the original 0.20.1 `swap_dims` bug belonged to — a
+  shallow clone across the FFI boundary corrupting gradients, not a math error —
+  and no pairing of burn-internal backends can isolate it.
+- **On the backward pass they are not the same implementation at all.**
+  `Device::libtorch().autodiff()` differentiates with **burn-autodiff**;
+  libtorch supplies only the tensors its formulas evaluate on. Every burn
+  backend therefore shares one autograd, so no burn-vs-burn pairing — `cpu` vs
+  `flex` vs `ndarray` vs `libtorch` — can disagree about a *derivative*, only
+  about the forward kernels a derivative calls. `tch-raw` brings libtorch's own
+  autograd, making this the only pairing here whose backward pass is written
+  twice, independently. Since `fuzz_autograd` is where every bug so far has come
+  from, that is the larger half of the case for it.
+
+It is also the oracle burn cannot deprecate: `Device::libtorch()` is going away
+on burn `main`, but `tch` is an independent project, and what burn is dropping
+is the bridge, not the library.
+
+That is not a theoretical argument. Within a minute of being wired in, this
+pairing found **bug #5** — burn's `repeat_dim` tiles on the forward pass but
+un-tiles the gradient as though it had interleaved, so the gradient lands on
+the wrong elements whenever the repeated dimension has size > 1. Every burn
+backend computes the same wrong answer and agrees with every other, which is
+exactly why nothing before this could see it. Repro and root cause in
+[`bugs.md`](bugs.md).
+
+Two smaller backward divergences show up on published `0.22.0-pre.3` in
+single-instruction programs: `x.powf(0)` (burn drops the node from the graph and
+panics — bug #3, now fixed upstream but not in the published crate) and
+`x.powf(-2)` at `x == 0` (burn `NaN`, libtorch `-inf`, at a genuinely singular
+point). Neither is a translation artifact: the forward pass agrees on all 22
+instructions, which `cargo test --features oracle-tch,oracle-tch-raw` asserts
+exhaustively, isolated and chained.
+
+`BACKENDS=tch-raw,candle,flex` is the pairing that makes a divergence
+*triageable*, which is a different thing from finding one.
+
+Every target other than `candle` shares an implementation with some other
+target, and that bounds what a disagreement can mean. The four burn backends
+share burn-autodiff, so they cannot disagree about a derivative. `tch-raw` and
+`libtorch` share libtorch's forward kernels, so on the forward pass they cannot
+disagree about the math. candle shares neither: its kernels are its own and so
+is its autograd, making it the first target here that is independent on **both**
+passes at once. Two things follow, and the second is the one that earns its
+keep:
+
+- A `candle` vs `libtorch` forward agreement is *evidence* — two unrelated
+  implementations landing on the same number. `tch-raw` vs `libtorch` agreement
+  is close to a tautology.
+- **Triage by majority.** With two independent oracles running against burn,
+  where both agree and burn does not, burn is wrong and the report is a finding
+  ready to minimize; where the two oracles split, the question is about candle
+  rather than about burn, and the report can be set aside cheaply. Every
+  previous pairing produced reports that had to be root-caused before anyone
+  could tell which side was wrong.
+
+The cost is real and worth stating: a candle-vs-burn divergence does **not**
+localise the bug the way `libtorch` vs `tch-raw` does. Those two differ by
+exactly one thing — burn's FFI bridge — so a divergence there names its own
+culprit. candle and burn differ by two entire implementations. Running candle
+alongside `tch-raw` rather than instead of it is what buys the localisation
+back.
+
+candle is also a second answer to the deprecation problem. `Device::libtorch()`
+is going away on burn `main`; `tch` survives that because it is an independent
+project, and candle survives it twice over, sharing not even a C++ library with
+anything burn ships.
+
+Two translation caveats are worth knowing, both in
+[`ir/interpreter/candle.rs`](src/ir/interpreter/candle.rs)'s module doc: candle's
+plain `add`/`sub`/`mul`/`div` do not broadcast (the `broadcast_*` forms are the
+ones with burn's semantics), and `sigmoid` lives in `candle-nn` rather than
+`candle-core` — it is pulled in for that one op rather than open-coding
+`(1 + (-x).exp()).recip()`, since an open-coded version would differ from burn
+in *composition* and those differences are indistinguishable from the bugs this
+fuzzer looks for.
+
+Unset `BACKENDS` runs everything compiled in, reference side first — `tch-raw`
+when `oracle-tch-raw` is compiled in, else `candle`, else `cpu`, else
+`libtorch`, else `ndarray` alone. A selection naming an unknown entry, or one this build lacks,
+fails loudly with the missing feature named rather than silently comparing fewer
+sides than asked for.
 
 Crash artifacts are stored in `fuzz/artifacts/fuzz_autograd/`. Example reproductions are in `examples/`.
 
@@ -111,7 +212,7 @@ The fuzzer's reach is currently bounded in four specific places:
 - **Special-value seeding.** `bytes_to_floats` maps seed bytes uniformly into
   `[-1, 1]`, so it never *directly* produces `NaN`, `±inf`, subnormals, signed
   zero, or exact `±1` boundaries — those only arise incidentally, downstream of
-  something like `log(x < 0)`. Three of the four bugs found so far are
+  something like `log(x < 0)`. Three of the five bugs found so far are
   special-value dependent. A seeded special-value pool mixed into leaf data is
   probably the cheapest available yield increase in the whole roadmap.
 
@@ -123,9 +224,10 @@ run, rather than just a bigger wall-clock number:
   `cargo fuzz coverage` to report which ops and which backend code paths are
   actually being exercised — so op-coverage work is driven by a coverage gap
   rather than by guessing.
-- **Backend coverage.** Both fuzz targets currently compare NdArray against the
-  LibTorch oracle only, even though the interpreter is already backend-agnostic.
-  Adding backends is mostly free; the details are below.
+- **~~Backend coverage.~~ Done.** Both targets now run any combination of
+  NdArray, burn-flex, LibTorch, CubeCL CPU and raw tch-rs, selected at runtime.
+  See [Choosing which backends to compare](#choosing-which-backends-to-compare);
+  what each one cost to add is below.
 - **Oracle tolerance is itself a bug-hiding knob.** The `recip` precision bug
   was a ~0.2% relative error that `macerator`'s own test suite missed because
   its tolerance was `2^-8`. `compare_outputs`'s tolerance should be tracked
@@ -133,24 +235,12 @@ run, rather than just a bigger wall-clock number:
   for ops where last-bit transcendental divergence between backends is genuinely
   expected — rather than one loose global epsilon that quietly absorbs real bugs.
 - **~~The oracle cannot see any special-value divergence~~ — fixed.** The old
-  `compare_outputs` decided divergence solely with
-  `abs_diff > 1e-4 * scale`, and that expression is `false` for every pair
-  involving a `NaN` or an infinity: `(NaN - x).abs()` is `NaN` and `NaN > t` is
-  `false`, while an infinite operand makes `scale`, and therefore the threshold
-  itself, infinite. Verified directly — `NaN` vs `-0.0`, `NaN` vs `42.0`, `+inf`
-  vs `-inf`, and `+inf` vs `1.0` are *all* reported as agreement today; only
-  finite-vs-finite divergence is detected at all. Three of the four bugs found so
-  far are special-value bugs, so this is the harness being blind to its own
-  subject matter: the burn-flex `sign(NaN)` divergence in the table below
-  (`NaN` where LibTorch gives `-0.0`) is exactly the shape the fuzzer would run
-  straight past. `values_diverge` now branches on `is_nan` /
-  `is_infinite` before the tolerance check (both-NaN counts as agreement,
-  infinities compare exactly including sign), with unit tests for each case.
-  Measured consequence: on the real libtorch-vs-flex gradient vectors below, the
-  old comparison reported **0** divergences and the new one reports **3** — so
-  before this fix the fuzzer could not have found the burn-flex bug even with
-  flex wired in, which is presumably why that one was caught by reading code
-  rather than by fuzzing.
+  comparison decided divergence solely with `abs_diff > 1e-4 * scale`, which is
+  `false` for every pair involving a `NaN` or an infinity — so the harness was
+  blind to exactly the bug class most of its findings belong to.
+  `values_diverge` now branches on `is_nan` / `is_infinite` first, with unit
+  tests for each case. Measured consequence and the bugs it cost: see
+  [`bugs.md`](bugs.md); the reasoning lives in that function's doc comment.
 
 #### Adding a backend
 
@@ -197,11 +287,13 @@ The work is therefore not in the interpreter. It is in three places:
    should be measured before a GPU goes anywhere near the hot loop.
 
 Two more things to expect. The first is **no longer a prediction**: `cargo-fuzz`
-defaults to ASAN, and every CubeCL backend does need `--sanitizer=none` — but not
-for the guessed reason. It is not GPU driver false positives; it is `linkme`'s
-dupcheck misfiring under ASAN inside CubeCL's `pliron` compiler layer, which
-means it bites the **CPU** backend too, with no GPU anywhere. Measured detail
-under "The CubeCL CPU backend is now wired in" below. The second is still
+defaults to ASAN, and every CubeCL backend does trip over it — but not for the
+guessed reason, and the remedy is narrower than expected. It is not GPU driver
+false positives; it is `linkme`'s dupcheck misfiring under ASAN inside CubeCL's
+`pliron` compiler layer, which means it bites the **CPU** backend too, with no
+GPU anywhere. `--sanitizer=none` works but overshoots: dropping just ASAN's
+global redzones with `-Cllvm-args=-asan-globals=0` keeps the sanitizer. Measured
+detail under "The CubeCL CPU backend is now wired in" below. The second is still
 untested: the `1e-4` relative tolerance in `compare_outputs` is probably too
 tight for GPU transcendentals (`exp`/`log`/`tanh`/`sigmoid`) against LibTorch
 CPU, so expect false-positive noise until tolerance is per-op.
@@ -216,7 +308,7 @@ alternatives on this machine:
 | Background-thread panics | **0** | **0** | 2 shader failures | 0 | — |
 | Needs `OnceLock` / readback / panic hook | **no** | **no** | all three | no | — |
 | Runs under ASAN | **yes** | **no** (linkme dupcheck) | untested | yes | — |
-| exec/s (30 s, `-max_len=8`) | untested | 323 | untested | untested | — |
+| exec/s (30 s, `-max_len=8`) | 5,334 (ASAN: 1,834) | 323 (ASAN: 227) | untested | untested | — |
 | RSS over a run | untested | climbs (260→562 Mb) | untested | untested | — |
 | Differential value | **high** (replaces NdArray) | **high** (CubeCL kernels, correct on `sign(NaN)`) | high (3rd implementation) | low (PyTorch vs PyTorch) | high |
 | Works here | yes | yes | with caveats | yes | no hardware |
@@ -225,8 +317,8 @@ Because burn-flex is pure-Rust CPU and synchronous, none of the three costs
 above apply to it: device construction is trivial, `into_data()` is not a device
 sync, and there are no worker threads to panic on. It is the one backend that
 can be added without touching `catch_as_result` or hoisting device construction
-— and it is the non-deprecated replacement for the backend three of the four
-known bugs live in. **It is now wired in**, behind `--features oracle-flex`.
+— and it is the non-deprecated replacement for the backend three of the five
+known bugs live in or reach through. **It is now wired in**, behind `--features oracle-flex`.
 
 That deprecation cuts deeper than it first appears: on burn `main`,
 `Device::libtorch()` is deprecated too ("burn-tch is deprecated and will be
@@ -247,8 +339,8 @@ device construction to hoist, no per-op tolerance needed.
 It has three costs of its own, though, and all three were measured only by
 actually running it — none was predicted:
 
-1. **It cannot be fuzzed under ASAN**, so every `cpu` run needs
-   `--sanitizer=none`. CubeCL reaches `pliron` (its MLIR-style compiler layer)
+1. **It breaks under *stock* ASAN** — fixable with one flag, see the end of this
+   item. CubeCL reaches `pliron` (its MLIR-style compiler layer)
    via `cubecl-cpu` → `cubecl-llvm`, and `pliron` registers dictionary keys with
    `linkme`'s `#[distributed_slice]`. Under ASAN that panics immediately:
 
@@ -269,10 +361,17 @@ actually running it — none was predicted:
 
    ASAN pads globals with redzones, which widens the gap between `linkme`'s
    dupcheck sentinels until its `dupcheck_start + 1 < dupcheck_stop` test fires
-   spuriously (`linkme-0.3.37/src/distributed_slice.rs:231`). Note the cost:
-   `cpu` runs give up the memory-safety sanitizer entirely. Worth knowing before
-   `cpu` becomes the default reference. (`-Clink-dead-code`, cargo-fuzz's other
-   default flag and the more obvious suspect, was tested and is *not* the cause.)
+   spuriously (`linkme-0.3.37/src/distributed_slice.rs:231`). (`-Clink-dead-code`,
+   cargo-fuzz's other default flag and the more obvious suspect, was tested and is
+   *not* the cause.)
+
+   **The fix keeps ASAN**: `RUSTFLAGS="-Cllvm-args=-asan-globals=0"` drops only
+   ASAN's *global* redzones. Verified on the real build — `BACKENDS=cpu` runs
+   clean, ASAN is still linked (116 `__asan` symbols plus the asan runtime
+   dylib), and a minimal crate confirms it still catches heap-buffer-overflows.
+   Only *global*-buffer-overflow detection is lost, which barely matters when
+   every tensor is heap-allocated. Measured price: `cpu` 227 exec/s under ASAN vs
+   323 with `--sanitizer=none` — about 1.4×.
 
 2. **CubeCL JIT-compiles kernels at runtime, so it is ~16× slower and its RSS
    climbs.** Measured over 30 s on identical settings (`-max_len=8`):
@@ -384,10 +483,10 @@ machinery:
    signature matches an already-patched bug, discard and continue — *before*
    spending anything on triage (see Phase 4).
 3. **Root-cause** to a specific line in the target or a dependency. This is the
-   step that must not be skipped: three of the four bugs so far were only
-   *filable* because the root cause was pinned to a line (`sign_op`'s
-   `is_positive()`, `float_powi_scalar`'s `float_ones`, `recip_f32`'s missing
-   Newton–Raphson refinement) — and the fourth is still unfiled precisely
+   step that must not be skipped: the three bugs that reached a PR did so only
+   because the root cause was pinned to a line (`sign_op`'s `is_positive()`,
+   `float_powi_scalar`'s `float_ones`, `recip_f32`'s missing Newton–Raphson
+   refinement) — and bug #4 is still unfiled precisely
    because it isn't.
 4. **Patch** in a fresh worktree on a fresh branch — one bug per branch, based
    on current upstream `main`, *not* stacked on the previous fix (Phase 3).
@@ -436,12 +535,13 @@ whole unmasking mechanism. An upstream reviewer needs each fix *alone*, based on
 upstream `main`: no burn maintainer will take one PR containing an ndarray NaN
 fix, a flex NaN fix, and an unrelated `powf_scalar` autodiff fix.
 
-A linear stack can't satisfy both. It's also already biting: `fix-powi-scalar-zero-grad`
-sits on top of `fix-sign-nan`, so promoting the powi fix alone means unpicking
-it from a fix it has nothing to do with — and `fix-sign-nan` itself carries a
-peer session's independent burn-flex fix as a second commit. If a maintainer
-wants one and not the other, or fixes `sign(NaN)` differently, that unpicking
-happens under exactly the time pressure this project exists to avoid.
+A linear stack can't satisfy both, and this one did bite:
+`fix-powi-scalar-zero-grad` sat on top of `fix-sign-nan`, so promoting the powi
+fix alone meant unpicking it from a fix it had nothing to do with — under
+exactly the time pressure this project exists to avoid. Both eventually went
+upstream as separate PRs ([#5665](https://github.com/tracel-ai/burn/pull/5665),
+[#5692](https://github.com/tracel-ai/burn/pull/5692)), which is the shape below,
+arrived at by hand. The point of Phase 3 is to not arrive at it by hand.
 
 So: **independent siblings, plus one throwaway integration branch.**
 
@@ -580,8 +680,9 @@ about *this* setup do look unusual:
 
 - **The oracle is a second implementation, not a sanitizer.** Nearly all
   auto-patch work targets crashes, UB, or vulnerabilities, where a sanitizer
-  declares the bug. Three of the four bugs here produce no crash at all — 0.2%
-  wrong numbers, a wrong `-0.0`, a silently-`None` gradient. There is nothing to
+  declares the bug. Four of the five bugs here produce no crash at all — 0.2%
+  wrong numbers, a wrong `-0.0`, a silently-`None` gradient, a gradient
+  permuted onto the wrong elements. There is nothing to
   bucket on, and the comparison tolerance is itself a knob that can hide bugs.
 - **Patch-to-unmask instead of suppress.** The standard answer to "one bug
   drowns the channel" is suppression or bucketing, which works fine for a stack
@@ -599,30 +700,27 @@ the next bug, applied to numerical and autodiff correctness rather than memory
 safety.* Narrow, true, and still interesting. Check the current literature
 before putting the word "first" in writing anywhere.
 
-### What to file first — and the burn-ndarray deprecation
+### What to file first
 
-`Device::ndarray()` carries `#[deprecated(since = "0.22.0", note = "burn-ndarray
-is deprecated and will be removed in a future release. Use Device::flex() for
-pure-Rust CPU execution instead.")]`. Three of the four bugs found so far live in
-a backend scheduled for deletion, which reorders what is worth filing:
+**Live status for every bug is in [`bugs.md`](bugs.md)** — what is merged, what
+is pending, and what is still unfiled. Two fixes are upstream
+([#5665](https://github.com/tracel-ai/burn/pull/5665) `sign(NaN)` across
+burn-ndarray *and* burn-flex, [#5692](https://github.com/tracel-ai/burn/pull/5692)
+autodiff gradients for zero scalar exponents); the macerator `recip` refinement
+is pending; two bugs remain unfiled.
 
-1. **`powf_scalar(0)` autodiff detachment** — in `burn-backend`'s default
-   `float_powi_scalar`, not deprecated, inherited identically by *every*
-   backend. Unambiguously the strongest PR of the three. File first.
-2. **burn-flex `sign(NaN)`** (the peer session's fix) — in the backend that
-   *replaces* NdArray, so it stays relevant after the removal.
-3. **burn-ndarray `sign(NaN)`** — correct, but a fix to code on its way out; a
-   maintainer may reasonably answer "NdArray is going away." Best filed as the
-   second half of the flex fix — one bug class, two backends — rather than alone.
+The principle that ordering followed, and still applies: `Device::ndarray()`
+carries `#[deprecated(since = "0.22.0")]`, so a fix to burn-ndarray alone is
+worth less to a maintainer than the same bug class fixed in burn-flex (its
+replacement) or in `burn-backend`/autodiff (which every backend inherits). Both
+merged PRs were of the latter two kinds. Bug #5 (`repeat_dim` backward) is in
+autodiff, which is why it leads the unfiled list.
 
-The same deprecation argues for revisiting the decision recorded in
-[`tensor_program.rs`](src/ir/interpreter/tensor_program.rs): NdArray was kept as
-the reference ("left") oracle side *until burn-flex has had a comparable amount
-of scrutiny*. That was reasonable when written, but the deprecation inverts it —
-bugs in a doomed backend are worth less to a maintainer, and burn-flex needs
-scrutiny precisely *because* it is the replacement. Switching the reference side
-to `flex()` is a one-line change, and the Metal probe above suggests CubeCL can
-serve as a third opinion when the two CPU backends disagree.
+That deprecation also settled the reference-side question recorded in
+[`tensor_program.rs`](src/ir/interpreter/tensor_program.rs): NdArray is no
+longer the reference. The order now lives in `Target::ALL`
+([`src/ir/program.rs`](src/ir/program.rs)) — raw tch-rs first, then CubeCL CPU,
+then LibTorch, then the two backends known to be wrong on `sign(NaN)`.
 
 ### The human gate, and non-goals
 
