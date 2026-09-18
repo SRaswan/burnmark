@@ -178,8 +178,12 @@ fn eval_tensor_instr_candle(
         TensorInstr::Matmul(a, b) => {
             let ai = a.resolve(n);
             match resolve_matmul_compatible(shapes, ai, b) {
-                // candle's matmul wants materialised operands; a transposed
-                // register is a strided view, and `Transpose` is one of the 22.
+                // candle's CPU matmul rejects some strided layouts outright
+                // (`MatMulUnexpectedStriding`), and `Transpose` — one of the 22
+                // — leaves exactly such a view.  Free when the operand is
+                // already contiguous: candle returns the same tensor, adding no
+                // graph node, so this costs nothing on the common path and
+                // nothing to the gradient on either.
                 Some(bi) => regs[ai].contiguous()?.matmul(&regs[bi].contiguous()?),
                 None => Ok(regs[ai].clone()),
             }

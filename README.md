@@ -6,6 +6,11 @@ This project evaluates the Rust ML ecosystem *correctness* via differential fuzz
 
 - **Tensor-level differential fuzzer** that generates shape-aware SSA programs and tests Burn's autograd engine across backends — NdArray, burn-flex, LibTorch and CubeCL CPU, in any combination, plus two non-burn targets, raw tch-rs and candle — cross-checking both forward values and gradients. Found distinct autograd crashes in Burn 0.20.1 and five further distinct bugs in 0.22; two fixes are merged upstream ([#5665](https://github.com/tracel-ai/burn/pull/5665), [#5692](https://github.com/tracel-ai/burn/pull/5692)). Status for each lives in [`bugs.md`](bugs.md).
 
+Backends:
+- burn: NdArray, burn-flex, LibTorch, CubeCL CPU
+- tch-rs
+- candle
+
 ## Running the Fuzzer
 
 All commands run from `burnmark/`. Requires `cargo-fuzz` (`cargo install cargo-fuzz`) and a nightly toolchain.
