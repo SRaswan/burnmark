@@ -150,6 +150,25 @@ is going away on burn `main`; `tch` survives that because it is an independent
 project, and candle survives it twice over, sharing not even a C++ library with
 anything burn ships.
 
+**Two known candle divergences, found within 90 s of wiring it in.** Both are
+candle's own, not burn's — on each, `libtorch`, `flex` and `ndarray` all agree
+*against* candle:
+
+| case | candle | libtorch / flex / ndarray |
+|---|---|---|
+| `relu'(0)` | `1.0` | `0.0` |
+| `d/dx log(relu(x))` at `x < 0` | `NaN` | `0.0` |
+
+Both come from candle's relu backward (`backprop.rs:634`), which masks with
+`ge(0)` where PyTorch's `threshold_backward` uses strictly-greater, and
+*multiplies* by that 0/1 mask where PyTorch *selects* — so `-inf × 0` becomes
+`NaN` instead of `0`. Since `relu` on negative inputs is common, a
+`fuzz_autograd` campaign including candle will halt on these repeatedly; run
+candle as a **third** target so the majority vote localises it, or use it in
+`fuzz_tensor_ops` (forward only), where it is clean. Note what *not* to do:
+special-casing `relu` in `values_diverge` would also hide bug #4, which is an
+open NaN-in-chained-`relu` bug in exactly this neighbourhood.
+
 Two translation caveats are worth knowing, both in
 [`ir/interpreter/candle.rs`](src/ir/interpreter/candle.rs)'s module doc: candle's
 plain `add`/`sub`/`mul`/`div` do not broadcast (the `broadcast_*` forms are the
