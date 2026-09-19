@@ -300,17 +300,102 @@ pub struct TensorProgram {
 
 impl fmt::Display for TensorProgram {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use super::interpreter::shape::{
+            Shape2, after_tensor_instr,
+            resolve_broadcast_compatible, resolve_concat_compatible, resolve_matmul_compatible,
+        };
+        use super::ops::POWF_EXPONENTS;
+
         let rows = (self.rows as usize).clamp(1, 16);
         let cols = (self.cols as usize).clamp(1, 16);
         writeln!(f, "=== TensorProgram [{}×{}] ===", rows, cols)?;
-        writeln!(f, "r0 = input({}×{}, {} seed bytes)", rows, cols, self.values.len())?;
-        let mut num_regs: usize = 1;
-        for instr in &self.ops {
-            let out = format!("r{}", num_regs);
-            writeln!(f, "{}", instr.ssa_line(&out, num_regs))?;
-            num_regs += 1;
+        writeln!(f, "r0 {} = input({} seed bytes)", Shape2(rows, cols), self.values.len())?;
+
+        let mut shapes: Vec<Shape2> = vec![Shape2(rows, cols)];
+        let total = self.ops.len();
+
+        for (i, instr) in self.ops.iter().enumerate() {
+            let n = shapes.len();
+            let out_shape = after_tensor_instr(&shapes, instr);
+            if out_shape.exceeds_cap() {
+                writeln!(
+                    f,
+                    "... ({} remaining op(s) skipped: r{n} would be {out_shape})",
+                    total - i,
+                )?;
+                break;
+            }
+            // Show the same resolved operands the driver uses so the display
+            // matches what was actually computed.
+            let rhs = match instr {
+                TensorInstr::Add(a, b) => {
+                    let ai = a.resolve(n);
+                    let bi = resolve_broadcast_compatible(&shapes, ai, b);
+                    format!("r{ai} + r{bi}")
+                }
+                TensorInstr::Sub(a, b) => {
+                    let ai = a.resolve(n);
+                    let bi = resolve_broadcast_compatible(&shapes, ai, b);
+                    format!("r{ai} - r{bi}")
+                }
+                TensorInstr::Mul(a, b) => {
+                    let ai = a.resolve(n);
+                    let bi = resolve_broadcast_compatible(&shapes, ai, b);
+                    format!("r{ai} * r{bi}")
+                }
+                TensorInstr::Div(a, b) => {
+                    let ai = a.resolve(n);
+                    let bi = resolve_broadcast_compatible(&shapes, ai, b);
+                    format!("r{ai} / r{bi}")
+                }
+                TensorInstr::Matmul(a, b) => {
+                    let ai = a.resolve(n);
+                    match resolve_matmul_compatible(&shapes, ai, b) {
+                        Some(bi) => format!("r{ai} @ r{bi}"),
+                        None => format!("r{ai}  # matmul: no compatible b, passthrough"),
+                    }
+                }
+                TensorInstr::Neg(r)    => format!("-r{}", r.resolve(n)),
+                TensorInstr::Abs(r)    => format!("abs(r{})", r.resolve(n)),
+                TensorInstr::Exp(r)    => format!("exp(r{})", r.resolve(n)),
+                TensorInstr::Log(r)    => format!("log(r{})", r.resolve(n)),
+                TensorInstr::Sqrt(r)   => format!("sqrt(r{})", r.resolve(n)),
+                TensorInstr::PowfScalar(r, e) => {
+                    let exp = POWF_EXPONENTS[*e as usize % POWF_EXPONENTS.len()];
+                    format!("r{}.powf({exp})", r.resolve(n))
+                }
+                TensorInstr::Relu(r)   => format!("relu(r{})", r.resolve(n)),
+                TensorInstr::Sigmoid(r)=> format!("sigmoid(r{})", r.resolve(n)),
+                TensorInstr::Tanh(r)   => format!("tanh(r{})", r.resolve(n)),
+                TensorInstr::SumAll(r) => format!("sum(r{})  # → [1×1]", r.resolve(n)),
+                TensorInstr::MeanAll(r)=> format!("mean(r{})  # → [1×1]", r.resolve(n)),
+                TensorInstr::SumDim(r, d) => {
+                    format!("sum(r{}, dim={})", r.resolve(n), *d as usize % 2)
+                }
+                TensorInstr::MeanDim(r, d) => {
+                    format!("mean(r{}, dim={})", r.resolve(n), *d as usize % 2)
+                }
+                TensorInstr::Transpose(r) => format!("r{}.T", r.resolve(n)),
+                TensorInstr::Concat(a, b, d) => {
+                    let ai = a.resolve(n);
+                    let dim = *d as usize % 2;
+                    match resolve_concat_compatible(&shapes, ai, b, dim) {
+                        Some(bi) => format!("cat([r{ai}, r{bi}], dim={dim})"),
+                        None => format!("r{ai}  # concat: no compatible b, passthrough"),
+                    }
+                }
+                TensorInstr::Repeat(r, d, c) => {
+                    let dim = *d as usize % 2;
+                    let count = (*c as usize).clamp(1, 4);
+                    format!("r{}.repeat(dim={dim}, ×{count})", r.resolve(n))
+                }
+                TensorInstr::Clamp(r) => format!("clamp(r{}, -1e6, 1e6)", r.resolve(n)),
+            };
+            writeln!(f, "r{n} {out_shape} = {rhs}")?;
+            shapes.push(out_shape);
         }
-        write!(f, "result = r{}.into_data()", num_regs - 1)
+
+        write!(f, "result = r{}", shapes.len() - 1)
     }
 }
 
@@ -582,5 +667,267 @@ mod target_selection_tests {
         assert!(available.iter().all(|t| t.is_compiled_in()));
         // NdArray is unconditional, so the list is never empty.
         assert!(available.contains(&Target::Burn(Backend::NdArray)));
+    }
+}
+
+#[cfg(test)]
+mod tensor_program_display_tests {
+    use super::*;
+    use crate::ir::ops::{Reg, TensorInstr};
+
+    /// TensorProgram::Display must show the same register indices that the driver
+    /// uses — i.e. the resolver-chosen ones, not the raw Reg.0 % n values. These
+    /// diverge whenever the preferred `b` operand is not broadcast-compatible and
+    /// the resolver falls back to an earlier register.
+    #[test]
+    fn display_shows_resolved_operands_not_raw_reg() {
+        // r0: [2×3]. r1 = Neg(r0) → [2×3].
+        // r2 = Add(r1, Reg(255)) — Reg(255) resolves to 255 % 2 = 1, which is
+        // broadcast-compatible ([2×3] vs [2×3]), so resolved b = 1.
+        let prog = TensorProgram {
+            rows: 2,
+            cols: 3,
+            values: vec![1, 2, 3],
+            ops: vec![
+                TensorInstr::Neg(Reg(0)),
+                TensorInstr::Add(Reg(1), Reg(255)),
+            ],
+        };
+        let s = format!("{prog}");
+        // Reg(255) resolves to 255 % 2 = 1 → display must say "r1 + r1".
+        assert!(
+            s.contains("r1 + r1"),
+            "expected 'r1 + r1' (Reg(255) % 2 = 1) in:\n{s}"
+        );
+        // All instructions must be shown (neither cap nor passthrough).
+        assert!(!s.contains("skipped"), "no instructions should be skipped: {s}");
+    }
+
+    /// When the resolved `b` is incompatible and the resolver falls back, the
+    /// display must show the actual fallback register, NOT the raw Reg.0 % n.
+    /// Here we contrive a situation where the preferred b is shape-incompatible.
+    #[test]
+    fn display_shows_fallback_register_when_preferred_b_is_incompatible() {
+        // r0: [2×3]. r1 = Transpose(r0) → [3×2].
+        // r2 = Add(r0, r1): r0 is [2×3], r1 is [3×2] → NOT broadcast-compatible.
+        // The resolver scans backwards from r1 and finds r0 (broadcast-compatible
+        // with itself), so resolved b = 0. Display must say "r0 + r0", not "r0 + r1".
+        let prog = TensorProgram {
+            rows: 2,
+            cols: 3,
+            values: vec![1, 2, 3],
+            ops: vec![
+                TensorInstr::Transpose(Reg(0)),          // r1 = r0.T → [3×2]
+                TensorInstr::Add(Reg(0), Reg(1)),         // r2 = r0 + r1?
+            ],
+        };
+        let s = format!("{prog}");
+        // r0 [2×3] is not broadcast-compatible with r1 [3×2], so the resolver
+        // falls back: scans (1, 0) in reverse and takes r0 (self-compatible).
+        // Displayed b must be r0, not r1.
+        assert!(
+            s.contains("r0 + r0"),
+            "expected fallback 'r0 + r0' ([2×3] incompatible with [3×2]) in:\n{s}"
+        );
+    }
+
+    /// exceeds_cap path: the display must note the truncation and not panic.
+    #[test]
+    fn display_notes_truncation_on_cap_overflow() {
+        // Chain Repeat(Reg(i), dim=0, count=4) using the previous register each
+        // time: r0=[1×1], r1=[4×1], r2=[16×1], ... r11=[4194304×1] > 2^20.
+        // Reg(i).resolve(i+1) = i because i < i+1, so each step repeats the
+        // previous output.
+        let mut ops = vec![];
+        for i in 0..12u8 {
+            ops.push(TensorInstr::Repeat(Reg(i), 0, 4));
+        }
+        let prog = TensorProgram { rows: 1, cols: 1, values: vec![42], ops };
+        let s = format!("{prog}");
+        assert!(
+            s.contains("skipped"),
+            "expected truncation note in:\n{s}"
+        );
+    }
+
+    /// Shapes annotated on every line must match after_tensor_instr's prediction.
+    #[test]
+    fn display_shape_annotations_match_predictor() {
+        use crate::ir::interpreter::shape::{after_tensor_instr, Shape2};
+        let prog = TensorProgram {
+            rows: 3,
+            cols: 4,
+            values: vec![0u8; 12],
+            ops: vec![
+                TensorInstr::Transpose(Reg(0)),     // [3×4] → [4×3]
+                TensorInstr::SumDim(Reg(1), 0),     // [4×3] → [1×3]
+                TensorInstr::Abs(Reg(2)),            // [1×3] → [1×3]
+            ],
+        };
+        let s = format!("{prog}");
+        // Verify the annotated shapes appear in the output.
+        assert!(s.contains("[4×3]"), "transpose output shape missing in:\n{s}");
+        assert!(s.contains("[1×3]"), "sum_dim output shape missing in:\n{s}");
+
+        // Cross-check with the predictor directly.
+        let mut shapes = vec![Shape2(3, 4)];
+        for instr in &prog.ops {
+            let predicted = after_tensor_instr(&shapes, instr);
+            shapes.push(predicted);
+        }
+        assert_eq!(shapes[1], Shape2(4, 3));
+        assert_eq!(shapes[2], Shape2(1, 3));
+        assert_eq!(shapes[3], Shape2(1, 3));
+    }
+}
+
+#[cfg(test)]
+mod autograd_generator_invariants {
+    use arbitrary::{Arbitrary, Unstructured};
+    use crate::ir::interpreter::shape::{
+        resolve_broadcast_compatible, resolve_matmul_compatible, resolve_concat_compatible,
+        Shape2, after_diff_op,
+    };
+    use crate::ir::ops::{DiffOp, TensorInstr};
+    use crate::ir::program::AutogradProgram;
+
+    /// The shape-aware generator stores exact register indices in every instruction
+    /// (not fuzzy Reg values that might require resolver fallback). Verify this by
+    /// replaying the program through the resolver and checking it never uses a
+    /// different register than the one stored.
+    ///
+    /// If this fails the generator is producing programs where the driver silently
+    /// executes different ops than the generator intended.
+    fn check_exact_refs(prog: &AutogradProgram, max_leaves: usize) {
+        let rows = (prog.rows as usize).clamp(1, 16);
+        let cols = (prog.cols as usize).clamp(1, 16);
+        let mut shapes: Vec<Shape2> = vec![Shape2(rows, cols)];
+        let mut leaf_count = 1usize;
+
+        for (step, op) in prog.ops.iter().enumerate() {
+            let n = shapes.len();
+            match op {
+                DiffOp::Leaf { seed, rows: lr, cols: lc } => {
+                    if leaf_count < max_leaves {
+                        let r = (*lr as usize).clamp(1, 16);
+                        let c = (*lc as usize).clamp(1, 16);
+                        shapes.push(Shape2(r, c));
+                        leaf_count += 1;
+                    } else {
+                        // Alias: seed % n must be in-bounds, which it is by construction.
+                        let alias_idx = (*seed as usize) % n;
+                        shapes.push(shapes[alias_idx]);
+                    }
+                }
+                DiffOp::Instr(instr) => {
+                    let stored_matches = match instr {
+                        TensorInstr::Add(a, b) | TensorInstr::Sub(a, b)
+                        | TensorInstr::Mul(a, b) | TensorInstr::Div(a, b) => {
+                            let ai = a.resolve(n);
+                            let resolved_bi = resolve_broadcast_compatible(&shapes, ai, b);
+                            resolved_bi == b.resolve(n)
+                        }
+                        TensorInstr::Matmul(a, b) => {
+                            let ai = a.resolve(n);
+                            // Generator falls back to unary when there are no matmul-
+                            // compatible registers, so the matmul arm is only emitted
+                            // when one exists — the stored b must be it.
+                            match resolve_matmul_compatible(&shapes, ai, b) {
+                                Some(resolved_bi) => resolved_bi == b.resolve(n),
+                                None => false,
+                            }
+                        }
+                        TensorInstr::Concat(a, b, d) => {
+                            let ai = a.resolve(n);
+                            let dim = *d as usize % 2;
+                            match resolve_concat_compatible(&shapes, ai, b, dim) {
+                                Some(resolved_bi) => resolved_bi == b.resolve(n),
+                                None => false,
+                            }
+                        }
+                        _ => true, // Unary ops: single Reg, no fallback possible.
+                    };
+                    assert!(
+                        stored_matches,
+                        "step {step}: generator stored a Reg that the driver would not \
+                         pick directly — program would execute different ops than generated.\n\
+                         instr: {:?}\nshapes: {shapes:?}",
+                        instr
+                    );
+                    let out_shape = after_diff_op(&shapes, op).unwrap();
+                    shapes.push(out_shape);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn generated_programs_use_exact_register_refs() {
+        // Deterministic seed corpus: exercise the generator across many inputs.
+        let seeds: &[&[u8]] = &[
+            &[0u8; 200],
+            &[255u8; 200],
+            // Alternating bytes to exercise both halves of every branch.
+            &{
+                let mut v = [0u8; 200];
+                for (i, b) in v.iter_mut().enumerate() { *b = (i as u8).wrapping_mul(37); }
+                v
+            },
+            &{
+                let mut v = [0u8; 200];
+                for (i, b) in v.iter_mut().enumerate() { *b = (i as u8).wrapping_mul(97).wrapping_add(13); }
+                v
+            },
+        ];
+        for raw in seeds {
+            let mut u = Unstructured::new(raw);
+            if let Ok(prog) = AutogradProgram::arbitrary(&mut u) {
+                check_exact_refs(&prog, 4);
+            }
+        }
+    }
+
+    /// Programs must never be cut short by exceeds_cap: the generator bounds all
+    /// shapes so the cap never fires for AutogradProgram.
+    #[test]
+    fn autograd_programs_never_exceed_cap() {
+        use crate::ir::shape::MAX_TENSOR_ELEMENTS;
+        let seeds: &[&[u8]] = &[
+            &[0u8; 300],
+            &[255u8; 300],
+            &{
+                let mut v = [0u8; 300];
+                for (i, b) in v.iter_mut().enumerate() { *b = (i as u8).wrapping_mul(61); }
+                v
+            },
+        ];
+        for raw in seeds {
+            let mut u = Unstructured::new(raw);
+            if let Ok(prog) = AutogradProgram::arbitrary(&mut u) {
+                let rows = (prog.rows as usize).clamp(1, 16);
+                let cols = (prog.cols as usize).clamp(1, 16);
+                let mut shapes: Vec<Shape2> = vec![Shape2(rows, cols)];
+                let mut leaf_count = 1usize;
+                for op in &prog.ops {
+                    let out = match op {
+                        DiffOp::Leaf { rows: lr, cols: lc, seed } => {
+                            if leaf_count < 4 {
+                                leaf_count += 1;
+                                Shape2((*lr as usize).clamp(1, 16), (*lc as usize).clamp(1, 16))
+                            } else {
+                                shapes[(*seed as usize) % shapes.len()]
+                            }
+                        }
+                        DiffOp::Instr(_) => after_diff_op(&shapes, op).unwrap(),
+                    };
+                    assert!(
+                        out.elements() <= MAX_TENSOR_ELEMENTS,
+                        "autograd generator produced a shape {out} exceeding the cap — \
+                         a MAX_DIM bound is wrong"
+                    );
+                    shapes.push(out);
+                }
+            }
+        }
     }
 }
