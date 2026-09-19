@@ -134,7 +134,14 @@ impl ProgramBuilder {
     }
 
     fn pick_reg(&self, u: &mut Unstructured) -> Result<(usize, Reg), ArbError> {
-        let idx: usize = u.int_in_range(0..=self.arena.len() - 1)?;
+        let n = self.arena.len();
+        let recent = 4.min(n);
+        // 70 % bias toward the last `recent` registers — creates deeper chains.
+        let idx = if recent < n && u.int_in_range(0u8..=9)? < 7 {
+            n - 1 - u.int_in_range(0..=recent - 1)?
+        } else {
+            u.int_in_range(0..=n - 1)?
+        };
         Ok((idx, Reg(idx as u8)))
     }
 

@@ -82,12 +82,24 @@ This is the "self-healing code" angle: differential fuzzing continuous enough to
 
 Full roadmap, orchestration design, and prior-art comparison: [`plans.md`](plans.md).
 
+## Generator design note — recent-register bias
+
+`generate.rs` uses a shape-aware state machine (`ProgramBuilder`) that produces well-typed SSA programs without any rejected or short-circuited instructions. The key design choice to be aware of:
+
+**`pick_reg` is biased 70 % toward the last 4 registers in the arena** (`generate.rs:pick_reg`). Without this, register selection is uniform over all existing registers, which produces wide shallow programs — most ops work on `r0` or an early register, and the gradient paths are trivially short. The bias creates deeper chains where each op builds on the previous result, which is the structure that exposes chain-rule bugs.
+
+The tradeoff: deeper chains mean a narrower exploration of the full register-pair space, and cross-register interactions between distant registers get less coverage. If you find the fuzzer keeps rediscovering the same patterns, loosening the bias (or making it adaptive — e.g. uniform for the first N steps, then biased) is the place to look.
+
+The bias only kicks in once the arena has more than 4 registers; below that it is uniform. The 70 % figure is a guess — it has not been tuned against a real corpus.
+
+Full roadmap, orchestration design, and prior-art comparison: [`plans.md`](plans.md).
+
 ## Key files
 
 | File | Purpose |
 |---|---|
 | `src/ir/ops.rs` | `TensorInstr` enum — the instruction vocabulary |
-| `src/ir/generate.rs` | Shape-aware SSA program generator |
+| `src/ir/generate.rs` | Shape-aware SSA program generator (see note below) |
 | `src/ir/shape.rs` | `Shape2`, all shape algebra, allocation cap |
 | `src/ir/interpreter/driver.rs` | Shared SSA walk (`Framework` trait) |
 | `src/ir/interpreter/mod.rs` | Burn interpreter + `values_diverge` |
