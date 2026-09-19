@@ -1,9 +1,6 @@
-//! Shape-aware state-machine program generator for [`AutogradProgram`].
-//!  1. New leaf — introduces a new `requires_grad` tensor.  The leaf shape
-//!     can be fully random or can inherit one dimension from an existing register and randomise the other
-//!  2. Operation — examines the arena and picks a mathematically legal op.
-//!     Unary / shape-changing ops are always legal.  Binary ops search for a compatible
-//!     pair; if none exists they fall back to a guaranteed-legal unary.
+//! Shape-aware state machine for generating [`AutogradProgram`]s. Each step
+//! either introduces a new leaf or picks a legal op given the current arena.
+//! Binary ops search for a compatible pair and fall back to unary if none exists.
 
 
 use arbitrary::{Arbitrary, Unstructured, Error as ArbError};
@@ -46,7 +43,6 @@ impl ProgramBuilder {
         }
     }
 
-    /// Register the seed leaf (r0).  Called exactly once before stepping.
     fn add_seed_leaf(&mut self, rows: u8, cols: u8, seed: Vec<u8>) {
         let r = (rows as usize).clamp(1, 16);
         let c = (cols as usize).clamp(1, 16);
@@ -137,13 +133,11 @@ impl ProgramBuilder {
         }
     }
 
-    /// Pick a random register index and return `(index, Reg)`.
     fn pick_reg(&self, u: &mut Unstructured) -> Result<(usize, Reg), ArbError> {
         let idx: usize = u.int_in_range(0..=self.arena.len() - 1)?;
         Ok((idx, Reg(idx as u8)))
     }
 
-    /// Push a `TensorInstr` op and record its output shape.
     fn push_instr(&mut self, instr: TensorInstr, out: Shape2) {
         self.ops.push(DiffOp::Instr(instr));
         self.arena.push(out);

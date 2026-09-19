@@ -1,27 +1,21 @@
-//! SSA instructions for fuzz IR.
-//!
-//! The register file is a `Vec<Tensor>`.  Each instruction produces exactly one
-//! value and appends it.  Operands are [`Reg(u8)`] references resolved at
-//! interpretation time as `raw % num_defined_regs`.
+//! SSA instruction set. Register file is a `Vec<Tensor>`; each instruction
+//! appends one value. Operand refs are `Reg(u8)` resolved as `raw % num_regs`.
 
 use std::fmt;
 use arbitrary::Arbitrary;
 
 // ─── register reference ──────────────────────────────────────────────────────
 
-/// A fuzzer-generated register reference.
-/// Resolved at interpretation time: `self.0 as usize % num_regs`.
+/// A fuzzer-generated register reference. Resolved as `self.0 as usize % num_regs`.
 #[derive(Arbitrary, Debug, Clone, Copy)]
 pub struct Reg(pub u8);
 
 impl Reg {
-    /// Resolve to a valid register index.  `num_regs` must be > 0.
     #[inline]
     pub fn resolve(&self, num_regs: usize) -> usize {
         (self.0 as usize) % num_regs
     }
 
-    /// Pretty-print using the resolved index.
     pub fn name(&self, num_regs: usize) -> String {
         format!("r{}", self.resolve(num_regs))
     }
@@ -36,11 +30,8 @@ impl fmt::Display for Reg {
 // ─── powf exponent table ──────────────────────────────────────────────────────
 
 /// Curated exponents for `PowfScalar`, indexed by `u8 % POWF_EXPONENTS.len()`.
-/// Mixes negative, fractional, and integer values: negative bases raised to a
-/// fractional exponent are undefined over the reals (`x.powf(0.5)` for
-/// `x < 0`), which is exactly the kind of special-value edge (NaN in the
-/// forward pass, and whatever that does to `grad * exp * x^(exp-1)` in the
-/// backward pass) both backends need to agree on.
+/// Mixes negative, fractional, and integer values to exercise NaN/inf paths
+/// (e.g. `x.powf(-0.5)` at `x < 0`) where backends must agree.
 pub const POWF_EXPONENTS: [f32; 16] = [
     -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0,
 ];
@@ -132,12 +123,8 @@ impl TensorInstr {
 
 // ─── SSA diff instruction ────────────────────────────────────────────────────
 
-/// SSA instruction for autograd programs.
-///
-/// `Leaf { seed, rows, cols }` introduces a new `requires_grad` input tensor
-/// with its own shape.  The `seed` byte selects data from the seed pool (or
-/// aliases a register when `max_leaves` is reached).  `Instr` wraps a
-/// [`TensorInstr`] — all the same ops, no duplication.
+/// SSA instruction for autograd programs. `Leaf` introduces a tracked input;
+/// `Instr` wraps any [`TensorInstr`].
 #[derive(Arbitrary, Debug, Clone)]
 pub enum DiffOp {
     /// Introduce a new leaf input with its own shape.
@@ -151,8 +138,6 @@ pub enum DiffOp {
 }
 
 impl DiffOp {
-    /// `num_regs` = how many registers are defined *before* this instruction.
-    /// For `Leaf`, a placeholder is printed; callers should override.
     pub fn ssa_line(&self, out: &str, num_regs: usize) -> String {
         match self {
             DiffOp::Leaf { rows, cols, .. } => {
