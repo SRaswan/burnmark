@@ -1,6 +1,6 @@
 # Plans & Roadmap
 
-Design document for where BurnMark is going. Read alongside [`CLAUDE.local.md`](CLAUDE.local.md) (architecture) and [`bugs.md`](bugs.md) (bug status).
+Design document for where BurnMark is going. Read alongside [`bugs.md`](bugs.md) for current bug status and the architecture section of [`README.md`](README.md) for codebase layout.
 
 ---
 

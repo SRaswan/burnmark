@@ -2,7 +2,7 @@
 
 **Differential fuzzer for Rust ML / autograd crates.**
 
-Generates shape-aware SSA tensor programs, runs them across multiple backends and frameworks simultaneously, and flags any divergence in forward values or gradients. Found and upstreamed five distinct bugs in Burn 0.22 ([#5665](https://github.com/tracel-ai/burn/pull/5665), [#5692](https://github.com/tracel-ai/burn/pull/5692)); full bug log in [`bugs.md`](bugs.md).
+Generates shape-aware SSA tensor programs, runs them across multiple backends and frameworks simultaneously, and flags any divergence in forward values or gradients. Found and upstreamed distinct bugs in Burn 0.22 ([#5665](https://github.com/tracel-ai/burn/pull/5665), [#5692](https://github.com/tracel-ai/burn/pull/5692)). Full bug log in [`bugs.md`](bugs.md)!
 
 ## Architecture
 
@@ -16,9 +16,9 @@ The codebase splits into two sharp layers:
 | **tch-rs interpreter** (`--features oracle-tch-raw`) | `ir/interpreter/tch_raw.rs` | 0 |
 | **candle interpreter** (`--features oracle-candle`) | `ir/interpreter/candle.rs` | 0 |
 
-The IR (ops, shapes, programs) is entirely framework-agnostic. Each interpreter is an independent ~22-arm match over the same `TensorInstr` enum — adding a new target means a new interpreter file and two one-line wrappers, not a trait or a generic.
+The IR (ops, shapes, programs) is entirely framework-agnostic. Each interpreter is an independent ~22-arm match over the same `TensorInstr` enum. Adding a new target (backend) means a new interpreter file and two one-line wrappers, not a trait or a generic.
 
-**There is exactly one trait**, `Framework` in `driver.rs`, and it abstracts the *scaffolding around* the match (register file, leaf seeding, grad extraction) — never the 22 arms themselves. See [`CLAUDE.local.md`](CLAUDE.local.md) for the full architecture notes before extending.
+**There is exactly one trait**, `Framework` in `driver.rs`, and it abstracts the *scaffolding around* the match (register file, leaf seeding, grad extraction).
 
 ## Backends / Targets
 
