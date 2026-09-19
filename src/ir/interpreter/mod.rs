@@ -5,15 +5,26 @@
 //! saves the crash artifact), in `Continuous` it logs to stderr and moves on.
 
 pub(crate) mod shape;
+/// The one SSA driver, shared by every target — and the crate's only trait.
+mod driver;
 mod tensor_program;
 mod autograd;
+/// Raw tch-rs — the one interpreter in this crate that names no burn type.
+#[cfg(feature = "oracle-tch-raw")]
+mod tch_raw;
+/// candle — the second interpreter here that names no burn type, and the first
+/// that also reaches none of burn's dependencies.
+#[cfg(feature = "oracle-candle")]
+mod candle;
 
 pub use tensor_program::run_tensor_program;
 pub use autograd::run_autograd_program;
 
-use burn::tensor::{activation, Tensor};
+use burn::tensor::{activation, Device, Gradients, Tensor};
 
+use driver::Framework;
 use super::ops::{TensorInstr, POWF_EXPONENTS};
+use super::program::Backend;
 use shape::{Shape2, resolve_broadcast_compatible, resolve_matmul_compatible, resolve_concat_compatible};
 
 // ─── shared utilities ────────────────────────────────────────────────────────
@@ -45,21 +56,113 @@ fn catch_as_result<F: FnOnce() + std::panic::UnwindSafe>(f: F) -> Result<(), Str
     })
 }
 
-/// Compare two output vectors element-wise with relative tolerance.
-#[cfg(feature = "oracle-tch")]
-fn compare_outputs(ndarray: &[f32], libtorch: &[f32], label: &str) {
-    assert_eq!(ndarray.len(), libtorch.len(), "oracle shape mismatch in {label}");
-    let mut mismatches = 0_usize;
-    for (_i, (&a, &b)) in ndarray.iter().zip(libtorch).enumerate() {
-        if a.is_nan() && b.is_nan() { continue; }
-        let abs_diff = (a - b).abs();
-        let scale = a.abs().max(b.abs()).max(1.0_f32);
-        if abs_diff > 1e-4_f32 * scale {
-            mismatches += 1;
+// ─── differential oracle ─────────────────────────────────────────────────────
+
+/// Relative tolerance for comparing finite values across backends.
+///
+/// Named rather than inlined because it is a bug-hiding knob: `macerator`'s own
+/// `recip` test used a `2^-8` tolerance, loose enough to hide a real ~0.2%
+/// precision bug for as long as that bug existed.
+pub const TOLERANCE: f32 = 1e-4;
+
+/// The device for one [`Backend`].
+///
+/// Burn 0.22 dropped the `Backend` type parameter from `Tensor`, so which
+/// backend runs an op is a property of the device, not of the tensor's type.
+/// That is what lets a single non-generic interpreter serve every backend.
+fn device_for(backend: Backend) -> Device {
+    match backend {
+        Backend::NdArray => {
+            #[allow(deprecated)]
+            Device::ndarray()
+        }
+        #[cfg(feature = "oracle-flex")]
+        Backend::Flex => Device::flex(),
+        #[cfg(feature = "oracle-tch")]
+        Backend::LibTorch => Device::libtorch(),
+        #[cfg(feature = "oracle-cpu")]
+        Backend::Cpu => Device::cpu(),
+        #[allow(unreachable_patterns)]
+        unavailable => panic!(
+            "backend {} is not compiled into this build",
+            unavailable.name()
+        ),
+    }
+}
+
+/// Whether two backends' values for the same element disagree.
+///
+/// Special values are branched on explicitly rather than left to the tolerance
+/// check, because `NaN`/`inf` arithmetic silently defeats it: `(NaN - x).abs()`
+/// is `NaN` and `NaN > t` is `false`, while an infinite operand makes `scale` —
+/// and therefore the threshold itself — infinite, so `inf > inf` is `false` too.
+/// A comparison written only as `abs_diff > TOLERANCE * scale` therefore reports
+/// **agreement** for every pair involving a `NaN` or an infinity, in either
+/// direction, which is what this harness used to do.
+///
+/// That mattered: three of the five backend bugs found so far are special-value
+/// bugs, so the old comparison was blind to its own subject matter. The
+/// burn-flex `sign(NaN)` divergence (`NaN` where LibTorch returns `-0.0`) is
+/// precisely the shape it ran straight past.
+fn values_diverge(a: f32, b: f32) -> bool {
+    if a.is_nan() || b.is_nan() {
+        // Both-NaN is agreement: NaN payloads carry no meaning here, and
+        // backends are not expected to produce matching bit patterns.
+        return a.is_nan() != b.is_nan();
+    }
+    if a.is_infinite() || b.is_infinite() {
+        // Infinities must match exactly, sign included.
+        return a != b;
+    }
+    let abs_diff = (a - b).abs();
+    let scale = a.abs().max(b.abs()).max(1.0_f32);
+    abs_diff > TOLERANCE * scale
+}
+
+/// Compare every non-reference backend against the reference (the first entry),
+/// returning one line per diverging backend.
+///
+/// Reports *all* diverging backends rather than stopping at the first, because
+/// one root cause can make two backends wrong in different ways: the `sign(NaN)`
+/// bug makes NdArray return `1/x` and burn-flex return `NaN` for the same input,
+/// and a first-mismatch-wins report would name only one of them.
+fn divergences(results: &[(&'static str, &[f32])], label: &str) -> Vec<String> {
+    let Some((&(ref_name, reference), others)) = results.split_first() else {
+        return Vec::new();
+    };
+    let mut report = Vec::new();
+    for &(name, values) in others {
+        if values.len() != reference.len() {
+            report.push(format!(
+                "{label}: {name} produced {} elements, {ref_name} produced {}",
+                values.len(),
+                reference.len()
+            ));
+            continue;
+        }
+        let diverging: Vec<usize> = (0..reference.len())
+            .filter(|&i| values_diverge(reference[i], values[i]))
+            .collect();
+        if let Some(&first) = diverging.first() {
+            report.push(format!(
+                "{label}: {name} diverges from {ref_name} at {}/{} elements \
+                 (first at [{first}]: {name}={:?}, {ref_name}={:?})",
+                diverging.len(),
+                reference.len(),
+                values[first],
+                reference[first],
+            ));
         }
     }
-    if mismatches > 0 {
-        panic!("oracle detected {} mismatches in {}", mismatches, label);
+    report
+}
+
+/// Panic if any backend diverges from the reference — the fuzz target turns that
+/// panic into a saved crash artifact.
+fn assert_agreement(results: &[(&'static str, &[f32])], label: &str) {
+    let report = divergences(results, label);
+    if !report.is_empty() {
+        panic!("differential divergence:\n{}", report.join("\n"));
     }
 }
 
@@ -144,5 +247,160 @@ fn eval_tensor_instr(
             regs[r.resolve(n)].clone().repeat_dim(dim, count)
         }
         TensorInstr::Clamp(r)     => regs[r.resolve(n)].clone().clamp(-1e6_f32, 1e6_f32),
+    }
+}
+
+// ─── burn as a `Framework` ────────────────────────────────────────────────────
+
+/// burn, on one device.
+///
+/// One struct covers every burn backend, because 0.22 made the backend a
+/// property of the `Device` rather than of the tensor's type — so unlike a
+/// non-burn target, adding a burn backend still costs zero interpreter code.
+///
+/// The *device* is what differs between the two program paths: the plain
+/// `TensorProgram` path wants a bare device and the autograd path wants
+/// `.autodiff()`, so the two constructors below are the whole difference.
+pub(super) struct BurnTarget {
+    device: Device,
+}
+
+impl BurnTarget {
+    /// For the forward-only path.
+    pub(super) fn forward(backend: Backend) -> Self {
+        BurnTarget { device: device_for(backend) }
+    }
+
+    /// For the autograd path.  `.autodiff()` is a `Device` method, so gradient
+    /// tracking comes along for every backend without the interpreter knowing
+    /// which one it is running on.
+    pub(super) fn autodiff(backend: Backend) -> Self {
+        BurnTarget { device: device_for(backend).autodiff() }
+    }
+}
+
+impl Framework for BurnTarget {
+    type Tensor = Tensor<2>;
+    type Grads = Gradients;
+
+    fn input(&self, raw: &[u8], rows: usize, cols: usize) -> Tensor<2> {
+        Tensor::<1>::from_floats(bytes_to_floats(raw, rows * cols).as_slice(), &self.device)
+            .reshape([rows, cols])
+    }
+
+    fn leaf(&self, raw: &[u8], rows: usize, cols: usize) -> Tensor<2> {
+        self.input(raw, rows, cols).require_grad()
+    }
+
+    fn alias(&self, tensor: &Tensor<2>) -> Tensor<2> {
+        // burn's `clone` shares the autodiff node, which is what `alias` needs.
+        tensor.clone()
+    }
+
+    fn eval(&self, regs: &[Tensor<2>], shapes: &[Shape2], instr: &TensorInstr) -> Tensor<2> {
+        eval_tensor_instr(regs, shapes, instr)
+    }
+
+    fn backward(&self, root: &Tensor<2>) -> Gradients {
+        // Seeds the root gradient with ones of the root's shape
+        // (`Gradients::new_with_hook` → `float_ones`) — the seed every other
+        // target has to match.
+        root.clone().backward()
+    }
+
+    fn grad(&self, grads: &Gradients, leaf: &Tensor<2>) -> Option<Tensor<2>> {
+        leaf.grad(grads)
+    }
+
+    fn to_vec(&self, tensor: &Tensor<2>) -> Vec<f32> {
+        tensor
+            .clone()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap_or_else(|e| panic!("burn into_data failed: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{divergences, values_diverge};
+
+    /// Every case here was silently reported as *agreement* by the previous
+    /// comparison, which only evaluated `abs_diff > TOLERANCE * scale`.
+    #[test]
+    fn special_value_divergence_is_detected() {
+        // NaN vs -0.0 is the exact signature of the sign(NaN) bug.
+        assert!(values_diverge(f32::NAN, -0.0));
+        assert!(values_diverge(-0.0, f32::NAN), "and in the other direction");
+        assert!(values_diverge(f32::NAN, 42.0));
+        assert!(values_diverge(f32::INFINITY, f32::NEG_INFINITY));
+        assert!(values_diverge(f32::INFINITY, 1.0));
+        assert!(values_diverge(1.0, f32::NEG_INFINITY));
+    }
+
+    #[test]
+    fn matching_special_values_agree() {
+        // NaN payloads are not meaningful across backends, so both-NaN agrees.
+        assert!(!values_diverge(f32::NAN, f32::NAN));
+        assert!(!values_diverge(f32::INFINITY, f32::INFINITY));
+        assert!(!values_diverge(f32::NEG_INFINITY, f32::NEG_INFINITY));
+    }
+
+    #[test]
+    fn finite_comparison_still_honours_tolerance() {
+        assert!(!values_diverge(1.0, 1.0));
+        assert!(!values_diverge(1.0, 1.000_01), "inside 1e-4 relative");
+        assert!(values_diverge(1.0, 1.01), "outside 1e-4 relative");
+        // Signed zero alone is not a divergence; only NaN-vs-(-0.0) is.
+        assert!(!values_diverge(0.0, -0.0));
+    }
+
+    /// The real measured three-way result for `abs(log(x))`'s gradient on
+    /// published 0.22.0-pre.3: NdArray and burn-flex are each wrong, in
+    /// *different* ways. A first-mismatch-wins report would name only one.
+    #[test]
+    fn every_diverging_backend_is_reported() {
+        let libtorch = [-0.0_f32, -4.0, 0.5, -0.0];
+        let ndarray = [-2.0_f32, -4.0, 0.5, -0.333_333_34];
+        let flex = [f32::NAN, -4.0, 0.5, f32::NAN];
+
+        let report = divergences(
+            &[("libtorch", &libtorch), ("ndarray", &ndarray), ("flex", &flex)],
+            "grad r0",
+        );
+        assert_eq!(report.len(), 2, "both wrong backends must be named: {report:?}");
+        assert!(report[0].contains("ndarray") && report[0].contains("2/4"));
+        assert!(report[1].contains("flex") && report[1].contains("2/4"));
+        assert!(report[1].contains("NaN"), "report should show the offending value");
+    }
+
+    /// The reference side is whichever backend is listed first, so the same
+    /// three results reported against a different reference name a different
+    /// set of culprits.
+    #[test]
+    fn reference_side_is_the_first_entry() {
+        let ndarray = [-2.0_f32, -4.0];
+        let flex = [f32::NAN, -4.0];
+        let report = divergences(&[("flex", &flex), ("ndarray", &ndarray)], "g");
+        assert_eq!(report.len(), 1);
+        assert!(report[0].contains("ndarray diverges from flex"), "{report:?}");
+    }
+
+    #[test]
+    fn agreement_and_single_backend_produce_no_report() {
+        let a = [1.0_f32, 2.0];
+        assert!(divergences(&[("ref", &a), ("other", &a)], "x").is_empty());
+        // One backend selected: nothing to compare against.
+        assert!(divergences(&[("ref", &a)], "x").is_empty());
+        assert!(divergences(&[], "x").is_empty());
+    }
+
+    #[test]
+    fn shape_mismatch_is_reported_not_panicked() {
+        let short = [1.0_f32];
+        let long = [1.0_f32, 2.0];
+        let report = divergences(&[("ref", &long), ("other", &short)], "x");
+        assert_eq!(report.len(), 1);
+        assert!(report[0].contains("1 elements"));
     }
 }

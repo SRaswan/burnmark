@@ -11,6 +11,10 @@ cargo-fuzz = true
 
 [features]
 oracle-tch = ["fuzzburn/oracle-tch"]
+oracle-flex = ["fuzzburn/oracle-flex"]
+oracle-cpu = ["fuzzburn/oracle-cpu"]
+oracle-tch-raw = ["fuzzburn/oracle-tch-raw"]
+oracle-candle = ["fuzzburn/oracle-candle"]
 
 [dependencies]
 libfuzzer-sys = "0.4"
