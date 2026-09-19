@@ -58,18 +58,12 @@ fn catch_as_result<F: FnOnce() + std::panic::UnwindSafe>(f: F) -> Result<(), Str
 
 // ─── differential oracle ─────────────────────────────────────────────────────
 
-/// Relative tolerance for comparing finite values across backends.
-///
-/// Named rather than inlined because it is a bug-hiding knob: `macerator`'s own
-/// `recip` test used a `2^-8` tolerance, loose enough to hide a real ~0.2%
-/// precision bug for as long as that bug existed.
+/// Relative tolerance for finite comparisons. Named because it is a bug-hiding
+/// knob — macerator's `recip` test used `2^-8`, hiding a real 0.2% precision bug.
 pub const TOLERANCE: f32 = 1e-4;
 
-/// The device for one [`Backend`].
-///
-/// Burn 0.22 dropped the `Backend` type parameter from `Tensor`, so which
-/// backend runs an op is a property of the device, not of the tensor's type.
-/// That is what lets a single non-generic interpreter serve every backend.
+/// Map a backend to its device. Burn 0.22 made the backend a property of the
+/// device rather than the tensor type, so one non-generic interpreter serves all.
 fn device_for(backend: Backend) -> Device {
     match backend {
         Backend::NdArray => {
@@ -90,20 +84,10 @@ fn device_for(backend: Backend) -> Device {
     }
 }
 
-/// Whether two backends' values for the same element disagree.
-///
-/// Special values are branched on explicitly rather than left to the tolerance
-/// check, because `NaN`/`inf` arithmetic silently defeats it: `(NaN - x).abs()`
-/// is `NaN` and `NaN > t` is `false`, while an infinite operand makes `scale` —
-/// and therefore the threshold itself — infinite, so `inf > inf` is `false` too.
-/// A comparison written only as `abs_diff > TOLERANCE * scale` therefore reports
-/// **agreement** for every pair involving a `NaN` or an infinity, in either
-/// direction, which is what this harness used to do.
-///
-/// That mattered: three of the five backend bugs found so far are special-value
-/// bugs, so the old comparison was blind to its own subject matter. The
-/// burn-flex `sign(NaN)` divergence (`NaN` where LibTorch returns `-0.0`) is
-/// precisely the shape it ran straight past.
+/// Whether two values disagree. Special values are branched on explicitly:
+/// `(NaN - x).abs()` is `NaN`, and an infinite operand makes `scale` infinite,
+/// so `abs_diff > TOLERANCE * scale` silently reports agreement for every pair
+/// involving NaN or infinity. Three of the five bugs found are special-value bugs.
 fn values_diverge(a: f32, b: f32) -> bool {
     if a.is_nan() || b.is_nan() {
         // Both-NaN is agreement: NaN payloads carry no meaning here, and
@@ -119,13 +103,9 @@ fn values_diverge(a: f32, b: f32) -> bool {
     abs_diff > TOLERANCE * scale
 }
 
-/// Compare every non-reference backend against the reference (the first entry),
-/// returning one line per diverging backend.
-///
-/// Reports *all* diverging backends rather than stopping at the first, because
-/// one root cause can make two backends wrong in different ways: the `sign(NaN)`
-/// bug makes NdArray return `1/x` and burn-flex return `NaN` for the same input,
-/// and a first-mismatch-wins report would name only one of them.
+/// Compare every non-reference target against the first entry, one line per
+/// divergence. Reports all diverging targets — one bug can make two wrong in
+/// different ways (`sign(NaN)`: ndarray gives `1/x`, flex gives `NaN`).
 fn divergences(results: &[(&'static str, &[f32])], label: &str) -> Vec<String> {
     let Some((&(ref_name, reference), others)) = results.split_first() else {
         return Vec::new();
@@ -168,14 +148,8 @@ fn assert_agreement(results: &[(&'static str, &[f32])], label: &str) {
 
 // ─── shared instruction evaluator ────────────────────────────────────────────
 
-/// Evaluate one [`TensorInstr`] against the register file, using `shapes`
-/// to ensure binary operands are shape-compatible.
-///
-/// Burn 0.22 dropped the `Backend` type parameter from `Tensor` — which
-/// backend actually runs an op is now a property of the `Device` a tensor
-/// was created on, not of the tensor's type.  So this function (and the
-/// register file it operates on) no longer needs to be generic at all; the
-/// same code path handles NdArray and LibTorch registers alike.
+/// Evaluate one [`TensorInstr`]. Not generic — burn 0.22 made the backend a
+/// property of the device, so `Tensor<2>` covers every burn backend.
 fn eval_tensor_instr(
     regs: &[Tensor<2>],
     shapes: &[Shape2],
@@ -252,15 +226,8 @@ fn eval_tensor_instr(
 
 // ─── burn as a `Framework` ────────────────────────────────────────────────────
 
-/// burn, on one device.
-///
-/// One struct covers every burn backend, because 0.22 made the backend a
-/// property of the `Device` rather than of the tensor's type — so unlike a
-/// non-burn target, adding a burn backend still costs zero interpreter code.
-///
-/// The *device* is what differs between the two program paths: the plain
-/// `TensorProgram` path wants a bare device and the autograd path wants
-/// `.autodiff()`, so the two constructors below are the whole difference.
+/// burn, on one device. One struct covers every burn backend — the backend is a
+/// property of the device. The two constructors differ only by `.autodiff()`.
 pub(super) struct BurnTarget {
     device: Device,
 }
@@ -302,9 +269,6 @@ impl Framework for BurnTarget {
     }
 
     fn backward(&self, root: &Tensor<2>) -> Gradients {
-        // Seeds the root gradient with ones of the root's shape
-        // (`Gradients::new_with_hook` → `float_ones`) — the seed every other
-        // target has to match.
         root.clone().backward()
     }
 

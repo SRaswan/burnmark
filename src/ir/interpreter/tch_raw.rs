@@ -1,57 +1,18 @@
-//! Raw tch-rs interpreter — the same SSA IR, executed against libtorch directly.
+//! Raw tch-rs interpreter — libtorch called directly, no burn in the path.
 //!
-//! This is the crate's second *tensor-producing* consumer of [`TensorInstr`],
-//! and its first non-burn one.  `eval_tensor_instr_tch` is a **sibling** of
-//! `eval_tensor_instr`, not a generic version of it: a new consumer of the IR
-//! is a new `match`, not a new trait, and the IR, the generator, shape
-//! propagation, `values_diverge` and target selection all carry over untouched.
+//! [`Backend::LibTorch`] also reaches libtorch, but through burn-tch. Comparing
+//! `libtorch` vs `tch-raw` puts burn's FFI bridge under test on its own — the
+//! class the original 0.20.1 `swap_dims` bug belonged to.
 //!
-//! The SSA walk *around* that match is shared — see
-//! [`driver`](super::driver), which owns the register file, the leaf
-//! bookkeeping and the `exceeds_cap` break for every target.  That is a
-//! deliberately different boundary from a trait over the instruction set: the
-//! 22 arms below stay a free function, because every one of them is
-//! irreducibly per-framework.
+//! On the backward pass: `Device::libtorch().autodiff()` uses burn-autodiff, so
+//! every burn backend shares one set of derivative formulas. This target brings
+//! libtorch's own autograd, making it the only pairing where the backward pass is
+//! implemented twice independently.
 //!
-//! # Why this target exists
-//!
-//! `Backend::LibTorch` already runs libtorch — but it reaches it through
-//! burn-tch, so burn's FFI/translation layer sits inside the reference side.
-//! Comparing `libtorch` against `tch-raw` puts that layer, and only that layer,
-//! under test on the forward pass: identical kernels on both sides, burn's
-//! bridge on one of them.  That is the class the original 0.20.1 `swap_dims`
-//! bug belonged to — a shallow clone across the FFI boundary corrupting
-//! gradients, not a math bug — and no pairing of burn-internal backends can
-//! isolate it.
-//!
-//! **On the backward pass it buys considerably more than that**, for a reason
-//! worth stating plainly: `Device::libtorch().autodiff()` differentiates with
-//! **burn-autodiff**.  libtorch supplies the tensors; burn supplies the
-//! derivative formulas and the graph.  Every burn backend therefore shares one
-//! autograd implementation, so no burn-vs-burn pairing — `cpu` vs `flex` vs
-//! `ndarray` vs `libtorch` — can ever disagree about a *derivative*, only about
-//! the forward kernels those derivatives call.  Raw tch-rs brings libtorch's
-//! own autograd, which makes this the first and only pairing in this fuzzer
-//! where the backward pass itself is implemented twice, independently.  Given
-//! that `fuzz_autograd` is where every bug so far has come from, that is the
-//! larger half of the case for this target.
-//!
-//! It is also the oracle burn cannot deprecate: `Device::libtorch()` is going
-//! away on burn `main`, but `tch` is an independent project and what burn is
-//! dropping is the bridge, not the library.
-//!
-//! # Fidelity notes
-//!
-//! Every arm below is written to match what burn's own libtorch backend emits
-//! for the same instruction, so that a divergence means a real disagreement
-//! rather than a harness mismatch.  The three places that needed care:
-//!
-//! * `SumDim`/`MeanDim` keep the reduced dimension (`keepdim = true`), which is
-//!   what `after_tensor_instr` predicts and what burn-tch passes.
-//! * `Repeat` is *tile* semantics (`[a,b] ×2 → [a,b,a,b]`), which is what both
-//!   burn's `repeat_dim` and libtorch's `repeat` do — not `repeat_interleave`.
-//! * `backward()` is seeded with ones — see [`TchRaw::backward`], which has to
-//!   sum the root first because libtorch refuses a non-scalar one.
+//! Fidelity notes (places that needed care):
+//! - `SumDim`/`MeanDim` use `keepdim = true`, matching burn and the shape predictor.
+//! - `Repeat` is tile semantics (`[a,b] ×2 → [a,b,a,b]`), not `repeat_interleave`.
+//! - `backward()` sums the root before calling it — see [`TchRaw::backward`].
 
 use tch::{Kind, Tensor};
 
@@ -68,9 +29,7 @@ const KIND: Kind = Kind::Float;
 
 // ─── data in / out ───────────────────────────────────────────────────────────
 
-/// Build one 2-D input tensor from fuzzer seed bytes, via the *same*
-/// `bytes_to_floats` the burn side uses — both targets must see bit-identical
-/// inputs or every comparison is meaningless.
+/// Build one 2-D input tensor from seed bytes via `bytes_to_floats`.
 fn make_tensor(raw: &[u8], rows: usize, cols: usize, requires_grad: bool) -> Tensor {
     let t = Tensor::from_slice(bytes_to_floats(raw, rows * cols).as_slice())
         .reshape([rows as i64, cols as i64]);
@@ -79,13 +38,8 @@ fn make_tensor(raw: &[u8], rows: usize, cols: usize, requires_grad: bool) -> Ten
     if requires_grad { t.set_requires_grad(true) } else { t }
 }
 
-/// Flatten to `Vec<f32>` — the counterpart of burn's
-/// `.into_data().try_to_vec::<f32>()`.
-///
-/// `contiguous()` is not optional: `Transpose` leaves a strided view, and the
-/// underlying `at_copy_data` blits raw memory, so a non-contiguous tensor would
-/// hand the oracle its elements in the wrong order — a fake divergence on every
-/// program containing a transpose.
+/// Flatten to `Vec<f32>`. `contiguous()` is required — `Transpose` leaves a
+/// strided view and blitting it reorders elements.
 fn to_vec(t: &Tensor) -> Vec<f32> {
     let flat = t.contiguous().reshape([-1_i64]);
     Vec::<f32>::try_from(&flat).unwrap_or_else(|e| panic!("tch-raw into_data failed: {e}"))
@@ -93,12 +47,8 @@ fn to_vec(t: &Tensor) -> Vec<f32> {
 
 // ─── instruction evaluator ───────────────────────────────────────────────────
 
-/// Evaluate one [`TensorInstr`] against the register file, using `shapes` to
-/// legalise binary operands.
-///
-/// The operand-resolution calls are shared with the burn interpreter rather
-/// than reimplemented, so both targets are guaranteed to pick the *same*
-/// registers for every instruction.
+/// Evaluate one [`TensorInstr`]. Uses the shared operand resolvers so this
+/// target picks the same registers as every other target.
 fn eval_tensor_instr_tch(regs: &[Tensor], shapes: &[Shape2], instr: &TensorInstr) -> Tensor {
     let n = regs.len();
     match instr {
@@ -175,13 +125,7 @@ fn eval_tensor_instr_tch(regs: &[Tensor], shapes: &[Shape2], instr: &TensorInstr
 
 // ─── the `Framework` impl ────────────────────────────────────────────────────
 
-/// Raw tch-rs as a target.
-///
-/// Stateless: libtorch's CPU device needs no handle, so there is nothing to
-/// carry.  The SSA walk — register file, leaf bookkeeping, `exceeds_cap` break,
-/// aliasing — lives in [`driver`](super::driver) and is shared with every other
-/// target, which is what guarantees this target and burn run the *same*
-/// program.
+/// Raw tch-rs as a target. Stateless — libtorch's CPU device needs no handle.
 pub(super) struct TchRaw;
 
 impl Framework for TchRaw {
@@ -199,10 +143,8 @@ impl Framework for TchRaw {
     }
 
     fn alias(&self, tensor: &Tensor) -> Tensor {
-        // `shallow_clone` specifically: it shares the autograd node, matching
-        // burn's `Tensor::clone`.  `tch::Tensor` has no `Clone` impl at all, so
-        // there is no wrong-by-default option here — but a `copy()` would be
-        // wrong, and would only show up in programs that hit the leaf cap.
+        // `shallow_clone` shares the autograd node (matching burn's `Tensor::clone`).
+        // `copy()` would silently drop the aliased leaf's gradient.
         tensor.shallow_clone()
     }
 
@@ -210,17 +152,10 @@ impl Framework for TchRaw {
         eval_tensor_instr_tch(regs, shapes, instr)
     }
 
-    /// # The backward seed
-    ///
-    /// burn seeds the root gradient with **ones of the root's shape**, while
-    /// libtorch refuses a non-scalar root outright.  Summing the root first is
-    /// exactly that ones-seed — `d(Σy)/dx == Σᵢ ∂yᵢ/∂x · 1` — so the two halves
-    /// stay comparable.  Reducing any other way (mean, first element) would
-    /// silently rescale every gradient and make every comparison wrong.
-    ///
-    /// A root that does not track gradients is left to fail here rather than
-    /// being guarded: burn panics in that situation too, and that panic *was*
-    /// bug #3 — `powf_scalar(0)` detaching from the graph.
+    /// libtorch refuses a non-scalar root, so we sum first. That is exactly the
+    /// ones-seed burn uses (`d(Σy)/dx == Σᵢ ∂yᵢ/∂x · 1`). Any other reduction
+    /// silently rescales every gradient. Don't guard a root with no grad — that
+    /// panic is the signal (it was bug #3).
     fn backward(&self, root: &Tensor) {
         root.sum(KIND).backward()
     }
@@ -240,36 +175,16 @@ impl Framework for TchRaw {
 // ─── fidelity tests ──────────────────────────────────────────────────────────
 
 /// Does this interpreter mean the same thing by each instruction as burn's own
-/// libtorch backend does?
+/// libtorch backend?
 ///
-/// # What is shared, and what is not
+/// Forward pass: both sides end in the same C++ library, so any divergence is a
+/// mistranslation (wrong `keepdim`, tile-vs-interleave, missing `contiguous()`).
+/// Asserted exhaustively.
 ///
-/// The two sides share the **forward** kernels: both end up in the same C++
-/// library, so for the forward pass there is no legitimate numerical difference
-/// and any divergence is a mistranslation in one of the 22 arms above — a wrong
-/// `keepdim`, tile-vs-interleave, a missing `contiguous()`. That is asserted
-/// exhaustively below, and it is what keeps a real `libtorch` vs `tch-raw`
-/// report meaningful.
-///
-/// The **backward** pass is a different matter, and it is the more interesting
-/// half.  `Device::libtorch().autodiff()` differentiates with **burn-autodiff**;
-/// libtorch's tensors are only the thing burn's own derivative formulas are
-/// evaluated on.  So the gradients compared here come from two genuinely
-/// independent autograd implementations — which is why the backward pass is
-/// deliberately *not* asserted per-op here: disagreement is the signal this
-/// target exists to produce, not a defect in the translation.  As of
-/// 0.22.0-pre.3 two instructions already disagree:
-///
-/// * `x.powf(0)` — burn drops the node from the graph entirely and panics
-///   ("Node should have a step registered"); libtorch keeps it.  Known bug,
-///   patched in `fuzz/Cargo.toml` but not in this crate's dependency graph.
-/// * `x.powf(-2)` at `x == 0` — burn yields `NaN`, libtorch `-inf`, for a
-///   derivative that is singular there.
-///
-/// What *is* asserted about the backward pass is the plumbing — leaf
-/// introduction, aliasing, unreachable leaves, and the ones-seeded root — since
-/// an error there would corrupt every gradient comparison rather than report a
-/// real one.
+/// Backward pass: *not* asserted per-op — disagreement is the signal. The two
+/// implementations are genuinely independent (burn-autodiff vs libtorch autograd).
+/// What is asserted is the plumbing: leaves, aliasing, unreachable leaves, the
+/// backward seed.
 #[cfg(all(test, feature = "oracle-tch"))]
 mod matches_burns_libtorch_backend {
     use crate::ir::interpreter::{run_autograd_program, run_tensor_program};

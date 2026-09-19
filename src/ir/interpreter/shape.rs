@@ -1,7 +1,4 @@
-//! Interpreter-side shape resolution and output-shape computation.
-//!
-//!  This module adds the `resolve_*` helpers (which need [`Reg`]) and the `after_*` 
-//!  methods that compute output shapes for every instruction variant.
+//! Output-shape computation and operand resolution for every instruction variant.
 
 pub(crate) use crate::ir::shape::Shape2;
 use crate::ir::ops::{Reg, TensorInstr, DiffOp};
@@ -71,7 +68,6 @@ pub(crate) fn after_tensor_instr(shapes: &[Shape2], instr: &TensorInstr) -> Shap
     }
 }
 
-/// Given a [`DiffOp`], compute the output shape.  
 pub(crate) fn after_diff_op(shapes: &[Shape2], op: &DiffOp) -> Option<Shape2> {
     match op {
         DiffOp::Leaf { .. } => None,
@@ -81,9 +77,7 @@ pub(crate) fn after_diff_op(shapes: &[Shape2], op: &DiffOp) -> Option<Shape2> {
 
 // ─── register resolution ────────────────────────────────────────────────────
 
-/// For element-wise binary operations (Add/Sub/Mul), resolve operand `b` to a
-/// register whose shape is **broadcast-compatible** with operand `a`.
-/// Falls back to `a` itself when nothing compatible exists.
+/// Resolve `b` to a broadcast-compatible register with `a`. Falls back to `a`.
 pub(crate) fn resolve_broadcast_compatible(shapes: &[Shape2], a_idx: usize, b_raw: &Reg) -> usize {
     let n = shapes.len();
     let b_idx = b_raw.resolve(n);
@@ -99,9 +93,8 @@ pub(crate) fn resolve_broadcast_compatible(shapes: &[Shape2], a_idx: usize, b_ra
     a_idx 
 }
 
-/// For matmul, resolve operand `b` to a register where
-/// `shapes[a_idx].cols == shapes[b_idx].rows`.
-/// Returns `None` when no compatible register exists.
+/// Resolve `b` to a matmul-compatible register (`a.cols == b.rows`). Returns `None`
+/// if none exists — callers pass through `a` unchanged in that case.
 pub(crate) fn resolve_matmul_compatible(shapes: &[Shape2], a_idx: usize, b_raw: &Reg) -> Option<usize> {
     let n = shapes.len();
     let b_idx = b_raw.resolve(n);
@@ -117,8 +110,7 @@ pub(crate) fn resolve_matmul_compatible(shapes: &[Shape2], a_idx: usize, b_raw: 
     None
 }
 
-/// For concat, resolve operand `b` to a register whose non-concat dimension
-/// matches `shapes[a_idx]`.  Returns `None` when no compatible register exists.
+/// Resolve `b` to a concat-compatible register (non-concat dim must match `a`).
 pub(crate) fn resolve_concat_compatible(
     shapes: &[Shape2],
     a_idx: usize,

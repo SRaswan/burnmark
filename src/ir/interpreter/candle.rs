@@ -1,80 +1,18 @@
-//! candle interpreter — the same SSA IR, executed against candle.
+//! candle interpreter — no burn and no libtorch anywhere in the path.
 //!
-//! This is the crate's third *tensor-producing* consumer of [`TensorInstr`],
-//! and its second non-burn one.  `eval_tensor_instr_candle` is a **sibling** of
-//! `eval_tensor_instr` and of `eval_tensor_instr_tch`, not a generic version of
-//! either: a new consumer of the IR is a new `match`, not a new trait.  The IR,
-//! the generator, shape propagation, the operand resolvers, `values_diverge`
-//! and target selection all carry over untouched; only this file is new.
+//! The only target here independent on both passes: its forward kernels and its
+//! autograd are its own. Combined with `tch-raw`, enables majority-vote triage:
+//! `BACKENDS=tch-raw,candle,flex` — both oracles agreeing against burn is a
+//! confirmed finding; oracles splitting means the question is about candle.
 //!
-//! # Why this target exists
-//!
-//! Every other target in this fuzzer shares an implementation with some other
-//! target, which bounds what a disagreement between them can mean:
-//!
-//! * The four burn backends share **burn-autodiff**.  `Device::libtorch()
-//!   .autodiff()` differentiates with burn's formulas, not libtorch's, so `cpu`
-//!   vs `flex` vs `ndarray` vs `libtorch` can disagree about a forward kernel
-//!   but never about a *derivative*.
-//! * [`Target::TchRaw`](crate::ir::program::Target::TchRaw) closes that gap on
-//!   the backward pass, but on the **forward** pass it is the same libtorch
-//!   kernels `Backend::LibTorch` already runs — what differs there is burn's
-//!   FFI bridge, which is valuable but is not a second opinion about the math.
-//!
-//! candle shares neither half with anything.  Its kernels are its own and its
-//! autograd is its own, so it is the first target here that is an independent
-//! implementation on **both** passes at once.  Two consequences follow, and the
-//! second is the one that matters:
-//!
-//! 1. A `candle` vs `libtorch` forward agreement is *evidence* — two unrelated
-//!    implementations landing on the same number — where `tch-raw` vs
-//!    `libtorch` agreement is close to a tautology.
-//! 2. With `tch-raw` also compiled in, a divergence is **triageable by
-//!    majority**.  `BACKENDS=tch-raw,candle,flex` runs two independent oracles
-//!    against burn: where both oracles agree and burn does not, burn is wrong
-//!    and the report is a finding; where the two oracles split, the question is
-//!    about candle rather than about burn.  That is the thing no pairing in
-//!    this fuzzer could do before, and it is why candle is worth a second
-//!    non-burn interpreter rather than a third burn device.
-//!
-//! # Fidelity notes
-//!
-//! Every arm below is written to mean what burn means by the same instruction,
-//! so that a divergence is a real disagreement rather than a harness mismatch.
-//! The places that needed care:
-//!
-//! * **Broadcasting is opt-in.**  candle's `add`/`sub`/`mul`/`div` require
-//!   identical shapes and error otherwise; the `broadcast_*` variants are the
-//!   ones with burn's semantics.  Using the plain forms would turn every
-//!   legally-broadcast operand pair — which `resolve_broadcast_compatible`
-//!   deliberately produces — into a harness error.
-//! * **`SumDim`/`MeanDim` keep the reduced dimension** (`*_keepdim`), which is
-//!   what `after_tensor_instr` predicts and what burn's `sum_dim`/`mean_dim` do.
-//!   candle's plain `sum`/`mean` squeeze it instead.
-//! * **`SumAll`/`MeanAll` reduce to rank 0** in candle, not to `[1,1]`; burn's
-//!   `.sum().unsqueeze::<2>()` lands on `[1,1]`, so these reshape.
-//! * **`Repeat` is tile semantics.**  candle's `repeat` is built on `cat`, so
-//!   `[a,b] ×2 → [a,b,a,b]`, matching burn's `repeat_dim` and libtorch's
-//!   `repeat` — not `repeat_interleave`.
-//! * **Data out must be contiguous**, for the reason it must be on the tch side:
-//!   `Transpose` leaves a strided view, and flattening one without a copy would
-//!   hand the oracle its elements in the wrong order — a fake divergence on
-//!   every program containing a transpose.
-//! * **`sigmoid` lives in `candle-nn`, not `candle-core`.**  It is a real op
-//!   there (a `CustomOp1` whose backward is `s·(1-s)`, which is burn's formula),
-//!   so this target is pulled in rather than the op being open-coded as
-//!   `(1 + (-x).exp()).recip()`.  An open-coded version would differ from burn
-//!   in *composition* — three ops where burn has one, with three chances to
-//!   round differently and a backward assembled from the chain rather than the
-//!   closed form — and those differences would be indistinguishable from the
-//!   backend bugs this fuzzer is looking for.
-//!
-//! One thing that needed no care at all, unlike tch: **the backward seed
-//! already matches.**  candle's `backward()` seeds the root gradient with
-//! `ones_like()` of the root, which is exactly what burn's
-//! `Gradients::new_with_hook` does with `float_ones`.  libtorch, by contrast,
-//! refuses a non-scalar root and forced `tch_raw` to sum first.  Nothing here
-//! rescales anything.
+//! Fidelity notes (places that needed care):
+//! - Broadcasting is opt-in: use `broadcast_add` etc., not plain `add`.
+//! - `SumAll`/`MeanAll` reduce to rank 0 in candle; reshape to `[1,1]` to match burn.
+//! - `SumDim`/`MeanDim` use `*_keepdim`, matching burn and the shape predictor.
+//! - `Repeat` is tile semantics (candle's `repeat` is built on `cat`).
+//! - `sigmoid` lives in `candle-nn`, not `candle-core`.
+//! - `contiguous()` before reading data — `Transpose` leaves a strided view.
+//! - Backward seed already matches burn's ones-of-root-shape; no sum needed.
 
 use candle_core::backprop::GradStore;
 use candle_core::{Device, Result, Tensor, Var};
@@ -87,15 +25,12 @@ use super::shape::{
 };
 use crate::ir::ops::{POWF_EXPONENTS, TensorInstr};
 
-/// candle's CPU device.  Cheap to construct (a unit enum variant), so unlike a
-/// real GPU backend there is nothing to hoist out of the per-iteration path.
+/// candle's CPU device. Unit enum variant — nothing to hoist per-iteration.
 const DEVICE: Device = Device::Cpu;
 
 // ─── data in / out ───────────────────────────────────────────────────────────
 
-/// Build one 2-D input tensor from fuzzer seed bytes, via the *same*
-/// `bytes_to_floats` every other target uses — all targets must see
-/// bit-identical inputs or every comparison is meaningless.
+/// Build one 2-D input tensor from seed bytes via `bytes_to_floats`.
 fn make_tensor(raw: &[u8], rows: usize, cols: usize) -> Tensor {
     Tensor::from_slice(
         bytes_to_floats(raw, rows * cols).as_slice(),
@@ -105,15 +40,9 @@ fn make_tensor(raw: &[u8], rows: usize, cols: usize) -> Tensor {
     .unwrap_or_else(|e| panic!("candle input construction failed: {e}"))
 }
 
-/// Build one 2-D `requires_grad` leaf.
-///
-/// candle tracks gradients for `Var`s specifically — there is no
-/// `require_grad()` flag on an ordinary tensor — so a leaf is a `Var` unwrapped
-/// back into the `Tensor` the register file holds.  The unwrapped tensor keeps
-/// `is_variable()`, which is what `backward()` stops at, and `Tensor::clone`
-/// shares its `TensorId`, so an aliased leaf still resolves to the same
-/// gradient entry (burn's `Tensor::clone` and tch's `shallow_clone` both behave
-/// this way too).
+/// Build one 2-D `requires_grad` leaf. candle uses `Var` for gradient tracking;
+/// unwrapping it to `Tensor` keeps `is_variable()` and a shared `TensorId`, so
+/// `Tensor::clone` (used in `alias`) still resolves to the same `GradStore` entry.
 fn make_leaf(raw: &[u8], rows: usize, cols: usize) -> Tensor {
     Var::from_slice(
         bytes_to_floats(raw, rows * cols).as_slice(),
@@ -124,12 +53,8 @@ fn make_leaf(raw: &[u8], rows: usize, cols: usize) -> Tensor {
     .into_inner()
 }
 
-/// Flatten to `Vec<f32>` — the counterpart of burn's
-/// `.into_data().try_to_vec::<f32>()`.
-///
-/// `contiguous()` is not optional: `Transpose` leaves a strided view, and
-/// flattening one without materialising it would report the elements in the
-/// wrong order — a fake divergence on every program containing a transpose.
+/// Flatten to `Vec<f32>`. `contiguous()` required — `Transpose` leaves a
+/// strided view and flattening it reorders elements.
 fn to_vec(t: &Tensor) -> Vec<f32> {
     t.contiguous()
         .and_then(|t| t.flatten_all())
@@ -139,16 +64,9 @@ fn to_vec(t: &Tensor) -> Vec<f32> {
 
 // ─── instruction evaluator ───────────────────────────────────────────────────
 
-/// Evaluate one [`TensorInstr`] against the register file, using `shapes` to
-/// legalise binary operands.
-///
-/// The operand-resolution calls are shared with the other interpreters rather
-/// than reimplemented, so every target is guaranteed to pick the *same*
-/// registers for every instruction — which is what makes a divergence mean
-/// disagreement about math rather than about which program was run.
-///
-/// Returns candle's own `Result` so the 22 arms stay one line each; the caller
-/// attaches the failing SSA line.
+/// Evaluate one [`TensorInstr`]. Uses the shared operand resolvers so this target
+/// picks the same registers as every other. Returns `Result` so each arm stays
+/// one line; the caller attaches the SSA line on failure.
 fn eval_tensor_instr_candle(
     regs: &[Tensor],
     shapes: &[Shape2],
@@ -251,13 +169,7 @@ fn eval_or_panic(regs: &[Tensor], shapes: &[Shape2], instr: &TensorInstr) -> Ten
 
 // ─── the `Framework` impl ────────────────────────────────────────────────────
 
-/// candle as a target.
-///
-/// Stateless: [`DEVICE`] is a unit enum variant, so there is nothing to carry.
-/// The SSA walk — register file, leaf bookkeeping, `exceeds_cap` break,
-/// aliasing — lives in [`driver`](super::driver) and is shared with every other
-/// target, which is what guarantees this target and burn run the *same*
-/// program.
+/// candle as a target. Stateless — [`DEVICE`] is a unit enum variant.
 pub(super) struct Candle;
 
 impl Framework for Candle {
@@ -273,10 +185,8 @@ impl Framework for Candle {
     }
 
     fn alias(&self, tensor: &Tensor) -> Tensor {
-        // candle's `Tensor` is an `Arc` over shared state, so a clone keeps the
-        // same `TensorId` and therefore resolves to the same `GradStore` entry
-        // — exactly what `alias` requires, and what burn's `Tensor::clone` and
-        // tch's `shallow_clone` do.  A `copy()` would be wrong.
+        // `Tensor` is an `Arc`; clone keeps the same `TensorId` → same `GradStore`
+        // entry. A `copy()` would silently drop the aliased leaf's gradient.
         tensor.clone()
     }
 
@@ -284,18 +194,9 @@ impl Framework for Candle {
         eval_or_panic(regs, shapes, instr)
     }
 
-    /// # The backward seed
-    ///
-    /// Nothing to reconcile here, unlike the tch side: candle seeds the root
-    /// gradient with `ones_like()` of the root and burn seeds it with
-    /// `float_ones` of the root, so both already mean the same thing by
-    /// `backward()`.  Nothing rescales.
-    ///
-    /// A root that does not track gradients is not guarded.  burn panics there
-    /// ("Tensor::backward requires a tracked autodiff tensor") and that panic
-    /// *was* bug #3 — `powf_scalar(0)` detaching from the graph.  candle simply
-    /// returns the ones-seed and no gradient for the leaf, which is a divergence
-    /// this target should *report*; a guard on either side would hide the class.
+    /// candle seeds with `ones_like()` matching burn's `float_ones` — nothing to
+    /// reconcile, unlike `tch_raw`. Don't guard an untracked root: that panic is
+    /// the signal (bug #3 was exactly `powf_scalar(0)` detaching from the graph).
     fn backward(&self, root: &Tensor) -> GradStore {
         root.backward()
             .unwrap_or_else(|e| panic!("candle backward failed: {e}"))
@@ -314,47 +215,22 @@ impl Framework for Candle {
 
 // ─── fidelity tests ──────────────────────────────────────────────────────────
 
-/// Does this interpreter mean the same thing by each instruction as burn does?
+/// Translation fidelity tests.
 ///
-/// # Why this file's tests are weaker than `tch_raw.rs`'s, and have to be
-///
-/// `tch_raw` can assert forward agreement with burn's LibTorch backend
-/// *exhaustively*, on negatives and zeros and every NaN path, because both
-/// sides end in the same C++ library: there is no legitimate numerical
-/// difference between them, so every disagreement is a mistranslation in one of
-/// its 22 arms.  candle shares no kernel with anything here, which is the whole
-/// point of adding it — and it means an assertion of that shape would be
-/// asserting that two independent implementations agree about `sign(NaN)` and
-/// `0^-2`, i.e. asserting away the signal this target exists to produce.
-///
-/// So the translation is pinned in two narrower ways instead:
-///
-/// * **Shapes, exhaustively and unconditionally** — the tests directly below.
-///   Every instruction's actual output shape must equal what
-///   `after_tensor_instr` predicted, isolated and chained.  This is pure
-///   translation, no arithmetic involved, and it is where a wrong `keepdim`, a
-///   squeezed whole-tensor reduction, a transposed `repeat` factor or a rank-0
-///   root would show up.  It needs no other target compiled in.
-/// * **Values, on inputs where the implementations have nothing to disagree
-///   about** — the [`against_libtorch`](matches_burn::against_libtorch)
-///   submodule.  [`WELL_BEHAVED`](matches_burn::WELL_BEHAVED) is strictly
-///   positive and bounded away from 0 and 1, so every one of the 22
-///   instructions — `log`, `sqrt`, every exponent in `POWF_EXPONENTS`, the
-///   `Div` that would otherwise divide by zero — stays finite and smooth.
-///
-/// Anything outside that is deliberately left to the fuzzer to report.
+/// Can't assert exhaustive forward agreement like `tch_raw.rs` — that would
+/// assert that two independent implementations agree about `sign(NaN)` and
+/// `0^-2`, i.e. assert away the signal this target exists to produce. Instead:
+/// - **Shapes**, exhaustively (no second target needed).
+/// - **Values** on `WELL_BEHAVED` inputs against libtorch — strictly positive,
+///   bounded away from 0 and 1, so every op stays finite and smooth.
 #[cfg(test)]
 mod matches_burn {
     use super::*;
     use crate::ir::interpreter::shape::after_tensor_instr;
     use crate::ir::ops::Reg;
 
-    /// Strictly positive, bounded away from 0 and 1, all distinct.
-    ///
-    /// `bytes_to_floats` maps a byte to `b/128 - 1`, so bytes above 128 give
-    /// `(0, 1)`.  Distinctness matters for `Repeat`: a tile and an interleave of
-    /// a constant are the same tensor, so a uniform seed would not tell them
-    /// apart.
+    /// Strictly positive, bounded away from 0 and 1, all distinct — so every op
+    /// stays finite and smooth, and tile vs interleave can be told apart on `Repeat`.
     pub(super) const WELL_BEHAVED: [u8; 9] = [160, 176, 192, 208, 224, 240, 255, 144, 200];
 
     /// Every [`TensorInstr`] variant, on a square `r0` so that matmul, concat
@@ -395,12 +271,8 @@ mod matches_burn {
         all
     }
 
-    /// Run `ops` through candle, asserting at every step that the tensor candle
-    /// actually produced has the shape `after_tensor_instr` predicted.
-    ///
-    /// The predicted shape — not the observed one — is what gets pushed into
-    /// `shapes`, exactly as the driver does, so a silent drift would compound
-    /// rather than self-correct.
+    /// Assert candle's actual output shape matches `after_tensor_instr`'s prediction.
+    /// Pushes the *predicted* shape, not the observed one, so drift compounds visibly.
     fn assert_shapes_match_prediction(ops: &[TensorInstr], rows: usize, cols: usize) {
         let mut regs = vec![make_tensor(&WELL_BEHAVED, rows, cols)];
         let mut shapes = vec![Shape2(rows, cols)];
@@ -419,9 +291,6 @@ mod matches_burn {
         }
     }
 
-    /// The assertion that needs no second target: a rank-0 root, a squeezed
-    /// reduction, a `keepdim` flipped the wrong way or a transposed `repeat`
-    /// factor all land here.
     #[test]
     fn shapes_match_the_ir_prediction() {
         for instr in every_instruction() {
@@ -435,9 +304,8 @@ mod matches_burn {
         }
     }
 
-    /// The `[1,1]` reshape on the whole-tensor reductions is the one place this
-    /// interpreter changes a rank rather than translating an op, so it gets its
-    /// own assertion rather than relying on the sweep above to cover it.
+    /// The rank reshape is the one place this interpreter changes rank rather than
+    /// translating an op directly, so it gets its own assertion.
     #[test]
     fn whole_tensor_reductions_are_rank_2() {
         for instr in [TensorInstr::SumAll(Reg(0)), TensorInstr::MeanAll(Reg(0))] {
@@ -463,18 +331,9 @@ mod matches_burn {
         );
     }
 
-    /// Value agreement, against libtorch.
-    ///
-    /// Gated on `oracle-tch` because libtorch is the strongest reference
-    /// available and the one whose special-value conventions the rest are judged
-    /// against.  burn's CPU backends are deliberately **not** used here: two of
-    /// them are known wrong on `sign(NaN)` (bug #2) and `recip` on aarch64 is
-    /// ~0.2% off in the published macerator (bug #1), so a failure against them
-    /// would be ambiguous between this file and a known burn bug.
-    ///
-    /// On [`WELL_BEHAVED`] input a divergence from libtorch is a translation
-    /// error with high probability, not a special-value opinion — which is what
-    /// makes these assertable at all between two independent implementations.
+    /// Value agreement against libtorch on `WELL_BEHAVED` inputs. Reference is
+    /// libtorch, not a burn CPU backend — two of those are known wrong on
+    /// `sign(NaN)` and `recip`, which would make a failure ambiguous.
     #[cfg(feature = "oracle-tch")]
     mod against_libtorch {
         use super::*;
