@@ -36,25 +36,18 @@ path = "fuzz_autograd.rs"
 test = false
 doc = false
 
-# All three known-fixed bugs patched in locally (none of the fixes are
-# upstream/published yet) so re-fuzzing surfaces NEW distinct crashes instead
-# of drowning in these:
-#   - burn: fix-powi-scalar-zero-grad branch (in a separate worktree,
-#     ~/Documents/Workspace/burn-powi-fix — stacked on fix-sign-nan so both
-#     fixes are present):
-#       - sign(NaN) == 0 in burn-ndarray's sign_op, fixes abs(log(x<0))
-#         gradient
-#       - burn-flex's float_sign had the same NaN bug independently (fixed
-#         upstream in the shared ~/Documents/Workspace/burn checkout, commit
-#         c11a8a037, by a peer session — not part of this worktree's own
-#         commits, but inherited since this branch is stacked on top)
-#       - x.powf_scalar(0) detached from the autodiff graph (float_ones has
-#         no relation to the input, so Autodiff<B> lost the backward edge);
-#         fixes the panic "Tensor::backward requires a tracked autodiff
-#         tensor" whenever a powf(0) precedes .backward()
-#   - macerator: v0.3.4-newton-fix branch (Newton-Raphson refinement after
-#     the aarch64 vrecpeq_f32 estimate, fixes recip() precision)
+# Fuzz against burn `main`, not the published `0.22.0-pre.4` the root crate
+# pins.  All five bugs this fuzzer has found are fixed upstream, but the
+# `repeat_dim` backward fix (#5837) landed after pre.4 was cut — pointing at a
+# release would mean every `Repeat` program re-finding a known bug instead of a
+# new one.  The root `Cargo.toml` stays on the published version on purpose, so
+# `examples/` keeps showing what a user of a release actually sees.
+#
+# No `[patch]` entries for the three previously-local fixes are needed anymore:
+# sign(NaN) (#5665) and powf_scalar(0) (#5692) are both in pre.4, and burn no
+# longer routes recip through macerator's `VRecip` at all (#5553), so the
+# macerator patch is moot — burn still pins macerator 0.3.4, which the merged
+# Newton-Raphson fix (macerator #47, unreleased) cannot semver-patch anyway.
 [patch.crates-io]
-burn = { path = "/Users/sraswan/Documents/Workspace/burn-powi-fix/crates/burn" }
-burn-ir = { path = "/Users/sraswan/Documents/Workspace/burn-powi-fix/crates/burn-ir" }
-macerator = { path = "/Users/sraswan/Documents/Workspace/macerator-v0.3.4-fixed" }
+burn = { git = "https://github.com/tracel-ai/burn", branch = "main" }
+burn-ir = { git = "https://github.com/tracel-ai/burn", branch = "main" }

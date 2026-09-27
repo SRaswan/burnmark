@@ -315,7 +315,7 @@ mod matches_burn {
         }
     }
 
-    /// `Repeat` must tile, not interleave — the distinction bug #5 turns on.
+    /// `Repeat` must tile, not interleave — the distinction bug #5 turned on.
     ///
     /// Asserted directly against the expected element order rather than against
     /// another target, because *both* semantics are shape-identical and burn's
@@ -419,12 +419,12 @@ mod matches_burn {
         /// claim, and a root whose shape differs from the leaf's is where a
         /// wrong one would show.
         ///
-        /// `Repeat` is safe to include despite bug #5 — burn's `repeat_dim`
-        /// backward regroups the incoming gradient as though the forward had
-        /// interleaved, but the incoming gradient *is* the ones-seed here, and
-        /// every regrouping of ones sums to the same thing.  The bug needs a
-        /// non-uniform gradient to become visible, which is the fuzzer's job,
-        /// not this test's.
+        /// `Repeat` was safe to include even while bug #5 was live (burn's
+        /// `repeat_dim` backward regrouped the incoming gradient as though the
+        /// forward had interleaved): the incoming gradient *is* the ones-seed
+        /// here, and every regrouping of ones sums to the same thing.  That is
+        /// also why burn's own tests missed it — exposing the permutation needs
+        /// a non-uniform gradient, which is the fuzzer's job, not this test's.
         #[test]
         fn backward_seed_matches_for_shape_changing_roots() {
             for root in [

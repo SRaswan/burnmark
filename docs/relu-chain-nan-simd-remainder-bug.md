@@ -1,14 +1,29 @@
-# `relu(relu(NaN))`'s gradient is wrong at the SIMD tail — mechanism not fully pinned down
+# `relu(relu(NaN))`'s gradient is wrong at the SIMD tail
 
 Found by `burnmark`'s `fuzz_autograd` target immediately after the
 `sign(NaN)`, macerator `recip()` precision, and `powf_scalar(0)` bugs were
 all patched in locally — a 25-minute continuous-mode run still produced 647
-crashes, all reducing to the same shape below. **Investigation stopped here
-at the user's request** (mid deep-dive into checkpointing internals) — this
-is the precise, reproducible signature and the strongest lead so far, not a
-pinned-down single line the way the other three bugs' docs are. Treat this
-as "ready to open an issue with a great repro", not "ready to open a PR with
-a fix".
+crashes, all reducing to the same shape below. Investigation stopped mid
+deep-dive into checkpointing internals, with a precise reproducible signature
+but no pinned-down line.
+
+**Status (2026-09-26): fixed upstream — and not by us.** This writeup was
+never filed. Five days later someone else filed
+[burn #5716](https://github.com/tracel-ai/burn/issues/5716) and
+[#5733](https://github.com/tracel-ai/burn/pull/5733) merged the same day
+(shipped in `0.22.0-pre.4`): float scalar-bound clamps are routed away from
+the SIMD min/max path, so NaN survives identically in the vector body and the
+scalar tail.
+
+Two lessons worth keeping:
+
+- **The checkpointing hypothesis below was wrong.** The second lead in *Next
+  steps* — `clamp_min`'s own NaN handling, independent of `RetroForward`
+  recomputation — was the right one. Chasing the more interesting mechanism
+  first cost the filing window.
+- **Root-causing should not gate filing.** The issue that beat this one had a
+  repro and no patch. This document already had a better repro than that, five
+  days earlier.
 
 ## TL;DR
 
@@ -115,11 +130,9 @@ across the same `n`-sweep the backward divergence was confirmed over.
   `lane-width`-shaped rather than aarch64-specific, that's further
   evidence for the SIMD-remainder theory over something checkpointing-only.
 
-## Where this should be filed
+## Where it was filed
 
-`tracel-ai/burn` (`burn-ndarray` and/or `burn-autodiff`, pending which side
-the trace above lands on) — worth opening as an issue with this repro and
-investigation notes even without a pinned-down single line; the repro alone
-(exact `n mod 4` tail divergence, NaN-and-two-relus-specific) is precise
-enough for someone with checkpointing-internals context to likely spot it
-quickly. Not filed anywhere yet.
+`tracel-ai/burn` — [#5716](https://github.com/tracel-ai/burn/issues/5716)
+(issue) and [#5733](https://github.com/tracel-ai/burn/pull/5733) (fix), both by
+other contributors. The fix landed in `burn-ndarray`, as the SIMD-remainder
+theory above predicted; `burn-autodiff`'s checkpointing was not involved.

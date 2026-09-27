@@ -1,4 +1,4 @@
-/// Burn 0.22.0-pre.3 numerical-correctness bug, found by fuzz_autograd within
+/// Burn numerical-correctness bug, found by fuzz_autograd within
 /// minutes of pointing burnmark at 0.22 (crash artifact:
 /// fuzz/artifacts/fuzz_autograd/crash-8c836557c70d855befc1fc350c33a1a55062fff0).
 ///
@@ -19,6 +19,14 @@
 /// both silently inherit the same ~0.2% error on any tensor with >= 32
 /// elements — no panic, no NaN, just quietly wrong numbers on every
 /// Apple-Silicon Mac.
+///
+/// FIXED as of 0.22.0-pre.4, which the root crate now pins — so this example
+/// is a regression check, not a live repro. burn stopped using macerator's
+/// low-precision `VRecip` entirely (burn #5553), computing f32 recip with
+/// exact SIMD division instead; burn-flex does the same. The macerator-side
+/// Newton-Raphson fix is merged too (macerator #47, unreleased), but burn
+/// pins macerator 0.3.4 and no longer depends on that path either way.
+/// To see the original divergence, pin burn to 0.22.0-pre.3.
 ///
 /// cargo run --example simd_recip_precision_bug --features oracle-tch --release
 
@@ -45,10 +53,9 @@ fn main() {
     println!("  NdArray  [0..4]  = {:?} ... [{}] = {}", &nd_vals[0..4], n - 1, nd_vals[n - 1]);
     println!("  LibTorch [0..4]  = {:?} ... [{}] = {}", &lt_vals[0..4], n - 1, lt_vals[n - 1]);
     println!(
-        "  expected exact value: -1.0 everywhere; NdArray's SIMD lanes give {} instead (rel. error {:.4}%)",
-        nd_vals[0],
-        (nd_vals[0] - lt_vals[0]).abs() * 100.0
+        "  max |NdArray - LibTorch| = {:.3e}  (was ~0.2% of the value on 0.22.0-pre.3)",
+        nd_vals.iter().zip(&lt_vals).map(|(a, b)| (a - b).abs()).fold(0.0_f32, f32::max)
     );
     assert_eq!(lt_vals, vec![-1.0_f32; n], "LibTorch is exact, as expected");
-    assert_ne!(nd_vals, lt_vals, "reproduces the NdArray SIMD recip precision bug");
+    assert_eq!(nd_vals, lt_vals, "regression: NdArray's SIMD recip must now be exact too");
 }

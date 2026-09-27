@@ -2,7 +2,9 @@
 
 **Differential fuzzer for Rust ML / autograd crates.**
 
-Generates shape-aware SSA tensor programs, runs them across multiple backends and frameworks simultaneously, and flags any divergence in forward values or gradients. Found and upstreamed distinct bugs in Burn 0.22 ([#5665](https://github.com/tracel-ai/burn/pull/5665), [#5692](https://github.com/tracel-ai/burn/pull/5692)). Full bug log in [`bugs.md`](bugs.md)!
+Generates shape-aware SSA tensor programs, runs them across multiple backends and frameworks simultaneously, and flags any divergence in forward values or gradients. Found five distinct bugs in Burn 0.22 and its SIMD dependency; three were upstreamed from here ([burn #5665](https://github.com/tracel-ai/burn/pull/5665), [burn #5692](https://github.com/tracel-ai/burn/pull/5692), [macerator #47](https://github.com/wingertge/macerator/pull/47)) and the other two were independently filed and fixed upstream. Full bug log in [`bugs.md`](bugs.md)!
+
+The fuzzer tracks burn `main`; the root crate pins the latest published release so the repros in `examples/` keep showing what a release user sees.
 
 ## Architecture
 

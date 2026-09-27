@@ -2,8 +2,11 @@
 
 Found by `burnmark`'s `fuzz_autograd` target after adding `powf_scalar` (and
 `Div`) to its op set, immediately after the SIMD `recip()` precision bug and
-the `sign(NaN)` bug were both patched in locally. Not filed anywhere yet —
-this is the write-up to file from, not a filed report.
+the `sign(NaN)` bug were both patched in locally.
+
+**Status (2026-09-26): fixed.** Merged as
+[burn #5692](https://github.com/tracel-ai/burn/pull/5692), shipped in
+`0.22.0-pre.4`.
 
 ## TL;DR
 
@@ -179,8 +182,9 @@ Validated: full `burn-backend-tests` suite against NdArray after the fix —
 value and the gradient), 0 failures. Confirmed the new test fails with the
 exact panic above against the unmodified code, passes after.
 
-## Where this should be filed
+## Where it was filed
 
-Squarely `tracel-ai/burn` — the bug is in `burn-backend`'s own shared
-default implementation, not a dependency. Not filed anywhere yet; this doc
-is the draft to file from, not a filed report.
+`tracel-ai/burn` — the bug was in `burn-backend`'s own shared default
+implementation, not a dependency. Filed and fixed from this writeup as
+[#5692](https://github.com/tracel-ai/burn/pull/5692), merged 2026-09-17 and
+shipped in `0.22.0-pre.4`.

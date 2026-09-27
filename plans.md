@@ -1,5 +1,7 @@
 # Plans & Roadmap
 
+*Updated 2026-09-26.*
+
 Design document for where BurnMark is going. Read alongside [`bugs.md`](bugs.md) for current bug status and the architecture section of [`README.md`](README.md) for codebase layout.
 
 ---
@@ -21,7 +23,7 @@ Supporting changes:
 - **Campaign discipline.** `-max_total_time` / `-jobs N` for parallel runs, `cargo fuzz cmin` to keep `fuzz/corpus/` from bloating, `cargo fuzz coverage` to drive op-coverage work from actual gaps rather than guesses.
 - **Oracle tolerance tracking.** The `recip` bug was a ~0.2% relative error that `macerator`'s test suite missed at `2^-8` tolerance. Track tolerance deliberately; maintain an explicit allowlist for ops where last-bit transcendental divergence is genuinely expected.
 - **Non-device axes.** The cheapest coverage left may not be a new device at all:
-  - `simd` on/off — `burn-ndarray` and `burn-flex` both default to `simd`; a scalar build is a build-axis comparison, relevant to bug #4.
+  - `simd` on/off — `burn-ndarray` and `burn-flex` both default to `simd`; a scalar build is a build-axis comparison. Two of the five bugs so far were SIMD-body-vs-scalar-tail splits, so this axis has a track record.
   - `fusion` on/off — fused vs unfused on the same device.
   - `autotune` on/off — autotune picking a wrong kernel.
   - `blas-netlib` — BLAS vs pure-Rust matmul.
@@ -49,7 +51,7 @@ CubeCL CPU's ASAN issue: `pliron` registers dictionary keys with `linkme`'s `#[d
 
 CubeCL CPU's coverage issue: 30 s produced 4,726 points on ndarray vs **39,898** on cpu — because the instrumented JIT is executing. LibFuzzer will optimise toward inputs stressing CubeCL's compiler, not burn's math. Treat cpu coverage numbers as incomparable.
 
-`sign(NaN)` correctness probe across backends on unpatched `0.22.0-pre.3` (gradient of `abs(log(x))` over `[-0.5, 0.25, 2.0, -3.0]`):
+`sign(NaN)` correctness probe across backends, as measured on unpatched `0.22.0-pre.3` before [#5665](https://github.com/tracel-ai/burn/pull/5665) (gradient of `abs(log(x))` over `[-0.5, 0.25, 2.0, -3.0]`) — kept as the worked example of a three-way divergence where a first-mismatch-wins report would name only one backend:
 
 | Backend | Gradient | Correct? |
 |---|---|---|
@@ -88,7 +90,7 @@ One unfixed bug saturates the crash channel; fix latency *is* discovery rate. Ev
 
 1. **Run** until crash/divergence; capture artifact.
 2. **Characterize** (Phase 1: minimize → dedup → sweep → bisect). If signature matches an already-patched bug, discard and continue before spending anything on triage.
-3. **Root-cause** to a specific line. This step must not be skipped — bug #4 is still unfiled precisely because it isn't pinned.
+3. **Root-cause** to a specific line. This must not *gate filing*, which is the mistake that lost bugs #4 and #5: both were held back for root-causing and someone else filed first. File on the repro, then pin the line on the filed issue.
 4. **Patch** in a fresh worktree on a fresh branch — one bug per branch, based on upstream `main`.
 5. **Validate:**
    - target's own test suite — zero new failures, zero new ignores;
@@ -131,7 +133,7 @@ Additional benefits:
 - **Fork CI is free cross-architecture validation.** Every bug so far is aarch64-SIMD-flavoured; pushing to the fork runs the target's own workflows on hardware we don't own.
 - **Cross-repo linking.** The `recip` fix belongs in `macerator` but the symptom is in `burn-ndarray`. A dependency-side PR should ship with a linked issue on the consumer.
 
-Maintain a **campaign ledger**: one row per distinct bug — signature, repro, root-cause line, branch, validation status, filed/unfiled — so "unfiled" is a visible number rather than something that quietly sits.
+Maintain a **campaign ledger**: one row per distinct bug — signature, repro, root-cause line, branch, validation status, filed/unfiled, *and days since found* — so "unfiled" is a visible, ageing number rather than something that quietly sits. Bugs #4 and #5 sat 5 and 6 days respectively before someone else filed them; the ledger exists to make that visible before it happens again.
 
 ---
 

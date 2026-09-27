@@ -1,4 +1,4 @@
-/// Burn 0.22.0-pre.3 autodiff bug, found by fuzz_autograd after adding
+/// Burn autodiff bug, found by fuzz_autograd after adding
 /// `powf_scalar` to its op set: every one of ~640 divergent runs in a
 /// 25-minute continuous-mode session reduced to a program with a `powf(0)`
 /// upstream of the final `.backward()` call.
@@ -41,6 +41,11 @@
 /// arm builds its result via `float_ones`, a tensor constructor with no
 /// relation to the input, instead of composing tracked ops the way every
 /// other arm does.
+///
+/// FIXED as of 0.22.0-pre.4 (burn #5692), which the root crate now pins — so
+/// this example is a regression check, not a live repro: it should now print
+/// `grad = [0.0, 0.0, 0.0]` on both backends, with no panic and no `None`.
+/// To see the original behaviour, pin burn to 0.22.0-pre.3.
 ///
 /// cargo run --example powi_scalar_zero_grad_bug --features oracle-tch --release
 use burn::tensor::{Device, Tensor};

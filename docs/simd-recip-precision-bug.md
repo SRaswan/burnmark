@@ -1,8 +1,15 @@
 # SIMD `recip()` silently loses precision on every accelerated backend
 
 Found by `burnmark`'s `fuzz_autograd` target within minutes of pointing it at
-Burn `0.22.0-pre.3`. Not filed anywhere yet — this is the write-up to file
-from, not a filed report.
+Burn `0.22.0-pre.3`.
+
+**Status (2026-09-26): fixed.** The Newton-Raphson fix is merged on macerator
+`main` as [#47](https://github.com/wingertge/macerator/pull/47), not yet
+released. burn is no longer exposed either way: it stopped routing `recip`
+through macerator's `VRecip` in
+[burn #5553](https://github.com/tracel-ai/burn/pull/5553) (shipped in
+`0.22.0-pre.4`), using exact SIMD division instead, and `burn-flex` does the
+same. Everything below describes `0.22.0-pre.3`, where it still reproduces.
 
 ## TL;DR
 
@@ -143,10 +150,15 @@ burn-ndarray could stop routing `recip` through the approximate SIMD path
 at all (use the exact `_mm_div_ps`/`vdivq_f32` per-lane instead) if the
 perf win of the unrefined estimate isn't worth the accuracy loss.
 
-## Where this should be filed
+## Where it was filed
 
-The bug is in `macerator`, not `burn` — that's where the actual fix has to
-land. `tracel-ai/burn` is arguably still worth a linked issue since burn
-users hit this without ever knowing macerator exists, and they'd want to
-pin a fixed macerator version once one exists. Neither has been filed yet;
-this doc is the draft to file from, not a filed report.
+`macerator` — that is where the fix had to land, and it did:
+[#47](https://github.com/wingertge/macerator/pull/47), merged 2026-09-22, not
+yet in a release.
+
+No linked burn issue was ever needed: burn had independently stopped calling
+the low-precision path in [#5553](https://github.com/tracel-ai/burn/pull/5553)
+(merged 2026-09-03, shipped in `0.22.0-pre.4`), so burn users were already
+covered by a release before the macerator fix merged. The cross-repo lesson
+still holds — check whether the *consumer* has routed around a dependency bug
+before assuming the dependency-side fix is what unblocks them.

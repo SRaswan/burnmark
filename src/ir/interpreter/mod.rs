@@ -320,8 +320,10 @@ mod tests {
     }
 
     /// The real measured three-way result for `abs(log(x))`'s gradient on
-    /// published 0.22.0-pre.3: NdArray and burn-flex are each wrong, in
-    /// *different* ways. A first-mismatch-wins report would name only one.
+    /// 0.22.0-pre.3, before burn #5665 fixed it: NdArray and burn-flex were
+    /// each wrong, in *different* ways. Kept as the regression case for
+    /// multi-backend reporting — a first-mismatch-wins report would name only
+    /// one of them.
     #[test]
     fn every_diverging_backend_is_reported() {
         let libtorch = [-0.0_f32, -4.0, 0.5, -0.0];
